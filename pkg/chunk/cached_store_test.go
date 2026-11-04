@@ -305,6 +305,122 @@ func TestStoreAsync(t *testing.T) {
 	}
 }
 
+func TestFlushStagingForceUpload(t *testing.T) {
+	mem, _ := object.CreateStorage("mem", "", "", "", "")
+	conf := defaultConf
+	conf.CacheDir = t.TempDir()
+	conf.Writeback = true
+	conf.WritebackThresholdSize = conf.BlockSize + 1
+	conf.UploadDelay = time.Hour
+	conf.StageUsageHigh = 0.8
+	conf.StageUsageLow = 0.7
+	store := NewCachedStore(mem, conf, nil).(*cachedStore)
+
+	w := store.NewWriter(7, 0)
+	data := bytes.Repeat([]byte{9}, 2048)
+	if _, err := w.WriteAt(data, 0); err != nil {
+		t.Fatalf("write: %s", err)
+	}
+	if err := w.Finish(len(data)); err != nil {
+		t.Fatalf("finish: %s", err)
+	}
+	store.pendingMutex.Lock()
+	pending := len(store.pendingKeys)
+	store.pendingMutex.Unlock()
+	require.Greater(t, pending, 0)
+
+	require.NoError(t, store.FlushStaging())
+	store.pendingMutex.Lock()
+	pending = len(store.pendingKeys)
+	store.pendingMutex.Unlock()
+	require.Zero(t, pending)
+	_, err := mem.Head(ctx, "chunks/0/0/7_0_2048")
+	require.NoError(t, err)
+}
+
+func TestFlushStagingObjectsAsync(t *testing.T) {
+	mem, _ := object.CreateStorage("mem", "", "", "", "")
+	conf := defaultConf
+	conf.CacheDir = t.TempDir()
+	conf.Writeback = true
+	conf.WritebackThresholdSize = conf.BlockSize + 1
+	conf.UploadDelay = time.Hour
+	store := NewCachedStore(mem, conf, nil).(*cachedStore)
+
+	const id uint64 = 77
+	const size = 4096
+	w := store.NewWriter(id, 0)
+	if _, err := w.WriteAt(bytes.Repeat([]byte{3}, size), 0); err != nil {
+		t.Fatalf("write: %s", err)
+	}
+	require.NoError(t, w.Finish(size))
+
+	queued, err := store.FlushStagingObjects([]StagingObject{{Id: id, Size: size}}, false)
+	require.NoError(t, err)
+	require.Greater(t, queued, 0)
+
+	// Async: may still be pending briefly; wait explicitly.
+	_, err = store.FlushStagingObjects([]StagingObject{{Id: id, Size: size}}, true)
+	require.NoError(t, err)
+	_, err = mem.Head(ctx, fmt.Sprintf("chunks/0/0/%d_0_%d", id, size))
+	require.NoError(t, err)
+}
+
+func TestPatchStagingOverwrite(t *testing.T) {
+	mem, _ := object.CreateStorage("mem", "", "", "", "")
+	conf := defaultConf
+	conf.CacheDir = t.TempDir()
+	conf.Writeback = true
+	conf.WritebackThresholdSize = conf.BlockSize + 1
+	conf.UploadDelay = time.Hour
+	store := NewCachedStore(mem, conf, nil).(*cachedStore)
+
+	const id uint64 = 42
+	const size = 1024
+	w := store.NewWriter(id, 0)
+	orig := bytes.Repeat([]byte{1}, size)
+	if _, err := w.WriteAt(orig, 0); err != nil {
+		t.Fatalf("write: %s", err)
+	}
+	if err := w.Finish(size); err != nil {
+		t.Fatalf("finish: %s", err)
+	}
+
+	patch := []byte("PATCH")
+	if !store.PatchStaging(id, size, 10, patch) {
+		t.Fatal("PatchStaging should succeed while block is pending")
+	}
+
+	p := NewPage(make([]byte, size))
+	n, err := store.NewReader(id, size).ReadAt(context.Background(), p, 0)
+	if err != nil || n != size {
+		t.Fatalf("read after patch: n=%d err=%v", n, err)
+	}
+	want := append([]byte{}, orig...)
+	copy(want[10:], patch)
+	if !bytes.Equal(p.Data, want) {
+		t.Fatalf("patched data mismatch: got %v want %v", p.Data[10:15], want[10:15])
+	}
+
+	// After forced upload, staging is gone and patch must fail.
+	store.pendingMutex.Lock()
+	var key string
+	for k := range store.pendingKeys {
+		key = k
+		break
+	}
+	item := store.pendingKeys[key]
+	store.pendingMutex.Unlock()
+	if item == nil {
+		t.Fatal("expected pending staging key")
+	}
+	item.uploading.Store(true)
+	store.uploadStagingFile(key, item.fpath)
+	if store.PatchStaging(id, size, 10, []byte("XXXXX")) {
+		t.Fatal("PatchStaging should fail after upload")
+	}
+}
+
 func TestForceUpload(t *testing.T) {
 	blob, _ := object.CreateStorage("mem", "", "", "", "")
 	config := defaultConf

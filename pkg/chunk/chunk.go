@@ -32,6 +32,9 @@ type Writer interface {
 	ID() uint64
 	SetID(id uint64)
 	SetWriteback(enabled bool)
+	// Uploaded returns how many leading bytes have already been flushed to
+	// object storage (or staging). Bytes before this offset must not be overwritten.
+	Uploaded() int
 	FlushTo(offset int) error
 	Finish(length int) error
 	Abort()
@@ -49,7 +52,23 @@ type ChunkStore interface {
 	FillCache(id uint64, size uint32, parts []Range) error
 	EvictCache(id uint64, size uint32, parts []Range) error
 	CheckCache(id uint64, size uint32, parts []Range, handler func(exists bool, loc string, size int)) error
+	// PatchStaging overwrites bytes inside a writeback-staged object that has
+	// not been uploaded to object storage yet. Returns false if any overlapping
+	// block is missing from staging or is currently uploading.
+	PatchStaging(id uint64, size int, off int, data []byte) bool
+	// FlushStaging force-uploads all writeback staging blocks and waits until
+	// the pending queue is drained (or times out).
+	FlushStaging() error
+	// FlushStagingObjects queues upload for the given staged objects.
+	// If wait is true, blocks until those objects leave the pending queue.
+	FlushStagingObjects(objs []StagingObject, wait bool) (queued int, err error)
 	UsedMemory() int64
 	UpdateLimit(upload, download int64)
 	BlobStorage() object.ObjectStorage
+}
+
+// StagingObject identifies a slice object whose staging blocks should be uploaded.
+type StagingObject struct {
+	Id   uint64
+	Size int
 }

@@ -72,12 +72,15 @@ type diskCache struct {
 	capacity      int64
 	maxItems      int64
 	freeRatio     float32
-	hashPrefix    bool
-	scanInterval  time.Duration
-	cacheExpire   time.Duration
-	pending       chan pendingFile
-	pages         map[string]*Page
-	m             *cacheManagerMetrics
+	// stageUsageHigh/Low are writeback staging usage watermarks (vs disk capacity).
+	stageUsageHigh float32
+	stageUsageLow  float32
+	hashPrefix     bool
+	scanInterval   time.Duration
+	cacheExpire    time.Duration
+	pending        chan pendingFile
+	pages          map[string]*Page
+	m              *cacheManagerMetrics
 
 	used      int64
 	keys      KeyIndex
@@ -96,6 +99,9 @@ type diskCache struct {
 	// newBlockCooldown reduces the initial access time for newly cached staged blocks.
 	// This helps prevent a surge of writes from evicting active read blocks.
 	stagedBlockCooldown time.Duration
+
+	stagedBytes       atomic.Int64
+	stageUploadActive atomic.Bool
 }
 
 func newDiskCache(m *cacheManagerMetrics, dir string, cacheSize, maxItems int64, pendingPages int, config *Config, uploader func(key, path string, force bool) bool) *diskCache {
@@ -119,6 +125,8 @@ func newDiskCache(m *cacheManagerMetrics, dir string, cacheSize, maxItems int64,
 		maxItems:            maxItems,
 		maxStageWrite:       config.MaxStageWrite,
 		freeRatio:           config.FreeSpace,
+		stageUsageHigh:      config.StageUsageHigh,
+		stageUsageLow:       config.StageUsageLow,
 		checksum:            config.CacheChecksum,
 		hashPrefix:          config.HashPrefix,
 		scanInterval:        config.CacheScanInterval,
@@ -354,12 +362,44 @@ func (cache *diskCache) checkFreeSpace() {
 			usage = cache.curFreeRatio()
 			cache.rawFull = cache.isFull(usage, false)
 		}
-		if cache.rawFull {
+		cache.updateStageUploadWatermark(usage.spaceCap)
+		if cache.rawFull || cache.stageUploadActive.Load() {
 			cache.uploadStaging()
 		}
 		time.Sleep(time.Second)
 	}
 	logger.Infof("stop checkFreeSpace at %s", cache.dir)
+}
+
+func (cache *diskCache) updateStageUploadWatermark(spaceCap uint64) {
+	if cache.stageUsageHigh <= 0 || spaceCap == 0 {
+		cache.stageUploadActive.Store(false)
+		return
+	}
+	ratio := float64(cache.stagedBytes.Load()) / float64(spaceCap)
+	if ratio >= float64(cache.stageUsageHigh) {
+		if cache.stageUploadActive.CompareAndSwap(false, true) {
+			logger.Infof("staging usage %.1f%% >= high watermark %.1f%% at %s, start uploading",
+				ratio*100, float64(cache.stageUsageHigh)*100, cache.dir)
+		}
+	} else if ratio <= float64(cache.stageUsageLow) {
+		if cache.stageUploadActive.CompareAndSwap(true, false) {
+			logger.Infof("staging usage %.1f%% <= low watermark %.1f%% at %s, stop uploading",
+				ratio*100, float64(cache.stageUsageLow)*100, cache.dir)
+		}
+	}
+}
+
+func (cache *diskCache) stageBytesToFree(spaceCap uint64) int64 {
+	if !cache.stageUploadActive.Load() || cache.stageUsageHigh <= 0 || spaceCap == 0 {
+		return 0
+	}
+	target := int64(float64(spaceCap) * float64(cache.stageUsageLow))
+	staged := cache.stagedBytes.Load()
+	if staged > target {
+		return staged - target
+	}
+	return 0
 }
 
 func (cache *diskCache) cleanupExpire() {
@@ -422,8 +462,12 @@ func (cache *diskCache) refreshCacheKeys() {
 func (cache *diskCache) removeStage(key string) error {
 	var err error
 	if err = cache.removeFile(cache.stagePath(key)); err == nil {
+		orig := int64(parseObjOrigSize(key))
 		cache.m.stageBlocks.Sub(1)
-		cache.m.stageBlockBytes.Sub(float64(parseObjOrigSize(key)))
+		cache.m.stageBlockBytes.Sub(float64(orig))
+		if left := cache.stagedBytes.Add(-orig); left < 0 {
+			cache.stagedBytes.Store(0)
+		}
 	}
 	// ignore ENOENT error
 	if err != nil && os.IsNotExist(err) {
@@ -786,6 +830,7 @@ func (cache *diskCache) stage(key string, data []byte, tierID uint8) (string, er
 		cache.m.stageBlocks.Add(1)
 		cache.m.stageBlockBytes.Add(float64(len(data)))
 		cache.m.stageWriteBytes.Add(float64(len(data)))
+		cache.stagedBytes.Add(int64(len(data)))
 		if cache.enabled() {
 			path := cache.cachePath(key)
 			cache.createDir(filepath.Dir(path))
@@ -886,7 +931,8 @@ func (cache *diskCache) uploadStaging() {
 	usage := cache.curFreeRatio()
 	spaceToFree := cache.spaceToFree(usage)
 	inodeToFree := cache.inodesToFree(usage)
-	if spaceToFree <= 0 && inodeToFree <= 0 {
+	stageToFree := cache.stageBytesToFree(usage.spaceCap)
+	if spaceToFree <= 0 && inodeToFree <= 0 && stageToFree <= 0 {
 		return
 	}
 	cache.Lock()
@@ -918,12 +964,14 @@ func (cache *diskCache) uploadStaging() {
 			logger.Debugf("upload %s, age: %d", key, uint32(time.Now().Unix())-lastValue.atime)
 			cache.Lock()
 			// the size in keys should be updated
-			spaceToFree -= int64(-lastValue.size + 4096)
+			freed := int64(-lastValue.size + 4096)
+			spaceToFree -= freed
+			stageToFree -= int64(-lastValue.size)
 			inodeToFree--
 			cnt = 0
 		}
 
-		if spaceToFree <= 0 && inodeToFree <= 0 {
+		if spaceToFree <= 0 && inodeToFree <= 0 && stageToFree <= 0 {
 			break
 		}
 	}
@@ -935,6 +983,39 @@ func (cache *diskCache) uploadStaging() {
 		}
 		cache.Lock()
 	}
+}
+
+// forceUploadAllStaging queues every staged block for upload (used by FlushStaging).
+func (cache *diskCache) forceUploadAllStaging() int {
+	if cache.uploader == nil {
+		return 0
+	}
+	cache.Lock()
+	var keys []string
+	for k, value := range cache.keys.randomIter() {
+		if value.size < 0 {
+			keys = append(keys, cache.getPathFromKey(k))
+		}
+	}
+	cache.Unlock()
+	n := 0
+	for _, key := range keys {
+		if cache.uploader(key, cache.stagePath(key), true) {
+			n++
+		}
+	}
+	return n
+}
+
+func (cache *diskCache) flushStagingKey(key string) bool {
+	if cache.uploader == nil {
+		return false
+	}
+	path := cache.stagePath(key)
+	if _, err := os.Stat(path); err != nil {
+		return false
+	}
+	return cache.uploader(key, path, true)
 }
 
 func (cache *diskCache) scanCached(fast bool) {
@@ -1047,6 +1128,7 @@ func (cache *diskCache) scanStaging() {
 			logger.Debugf("Found staging block: %s", path)
 			cache.m.stageBlocks.Add(1)
 			cache.m.stageBlockBytes.Add(float64(origSize))
+			cache.stagedBytes.Add(int64(origSize))
 			cache.uploader(key, path, false)
 			atomic.AddUint64(&count, 1)
 			atomic.AddUint64(&usage, uint64(origSize))

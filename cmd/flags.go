@@ -251,6 +251,16 @@ func dataCacheFlags() []cli.Flag {
 			Value: 0.1,
 			Usage: "min free space (ratio)",
 		},
+		&cli.Float64Flag{
+			Name:  "stage-usage-high-ratio",
+			Value: 0.8,
+			Usage: "start uploading staged blocks when staging usage / disk capacity reaches this ratio (writeback only; 0 disables)",
+		},
+		&cli.Float64Flag{
+			Name:  "stage-usage-low-ratio",
+			Value: 0.7,
+			Usage: "stop watermark-driven staging upload when usage drops to this ratio (writeback only)",
+		},
 		&cli.BoolFlag{
 			Name:  "cache-partial-only",
 			Usage: "cache only random/small read",

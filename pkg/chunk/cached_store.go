@@ -116,6 +116,9 @@ func (s *rSlice) ReadAt(ctx context.Context, page *Page, off int) (n int, err er
 	}
 
 	key := s.key(indx)
+	if n, ok := s.store.readStagingDirty(key, p, boff); ok {
+		return n, nil
+	}
 	if s.store.conf.CacheEnabled() {
 		start := time.Now()
 		r, err := s.store.bcache.load(key)
@@ -469,6 +472,10 @@ func (s *wSlice) ID() uint64 {
 	return s.id
 }
 
+func (s *wSlice) Uploaded() int {
+	return s.uploaded
+}
+
 func (s *wSlice) Len() int {
 	return s.length
 }
@@ -523,16 +530,21 @@ func (s *wSlice) Abort() {
 
 // Config contains options for cachedStore
 type Config struct {
-	CacheDir               string
-	CacheMode              os.FileMode
-	CacheSize              uint64
-	CacheItems             int64
-	CacheChecksum          string
-	CacheEviction          string
-	CacheScanInterval      time.Duration
-	CacheExpire            time.Duration
-	OSCache                bool
-	FreeSpace              float32
+	CacheDir          string
+	CacheMode         os.FileMode
+	CacheSize         uint64
+	CacheItems        int64
+	CacheChecksum     string
+	CacheEviction     string
+	CacheScanInterval time.Duration
+	CacheExpire       time.Duration
+	OSCache           bool
+	FreeSpace         float32
+	// StageUsageHigh is the staging usage / disk capacity ratio that starts
+	// background upload of staged blocks (writeback). 0 disables this watermark.
+	StageUsageHigh float32
+	// StageUsageLow is the ratio at which watermark-driven upload stops.
+	StageUsageLow          float32
 	AutoCreate             bool
 	Compress               string
 	MaxUpload              int
@@ -604,12 +616,36 @@ func (c *Config) SelfCheck(uuid string) {
 		if c.WritebackThresholdSize == 0 {
 			c.WritebackThresholdSize = c.BlockSize + 1
 		}
+		if c.StageUsageHigh == 0 && c.StageUsageLow == 0 {
+			c.StageUsageHigh = 0.8
+			c.StageUsageLow = 0.7
+		}
+		if c.StageUsageHigh < 0 {
+			c.StageUsageHigh = 0
+		}
+		if c.StageUsageHigh > 1 {
+			logger.Warnf("stage-usage-high-ratio should be in (0,1], got %v, set to 1", c.StageUsageHigh)
+			c.StageUsageHigh = 1
+		}
+		if c.StageUsageLow < 0 {
+			c.StageUsageLow = 0
+		}
+		if c.StageUsageHigh > 0 && c.StageUsageLow >= c.StageUsageHigh {
+			low := c.StageUsageHigh - 0.1
+			if low < 0 {
+				low = 0
+			}
+			logger.Warnf("stage-usage-low-ratio (%v) must be < high (%v), set low to %v", c.StageUsageLow, c.StageUsageHigh, low)
+			c.StageUsageLow = low
+		}
 	} else {
 		if c.UploadDelay > 0 || c.UploadHours != "" {
 			logger.Warnf("delayed upload is disabled in non-writeback mode")
 			c.UploadDelay = 0
 			c.UploadHours = ""
 		}
+		c.StageUsageHigh = 0
+		c.StageUsageLow = 0
 	}
 	if _, _, err := c.parseHours(); err != nil {
 		logger.Warnf("invalid value (%s) for upload-hours: %s", c.UploadHours, err)
@@ -660,6 +696,12 @@ func (c *Config) CacheEnabled() bool {
 	return c.CacheSize > 0
 }
 
+// stagingDirtyBlock holds in-memory overwrites for a staged (not yet Put) block
+// so random small writes do not rewrite the staging file on every request.
+type stagingDirtyBlock struct {
+	data []byte
+}
+
 type cachedStore struct {
 	storage         object.ObjectStorage
 	bcache          CacheManager
@@ -671,6 +713,8 @@ type cachedStore struct {
 	pendingCh       chan *pendingItem
 	pendingKeys     map[string]*pendingItem
 	pendingMutex    sync.Mutex
+	stagingDirty    map[string]*stagingDirtyBlock
+	stagingDirtyMu  sync.Mutex
 	startHour       int
 	endHour         int
 	compressor      compress.Compressor
@@ -854,6 +898,7 @@ func NewCachedStore(storage object.ObjectStorage, config Config, reg prometheus.
 		seekable:        compressor.CompressBound(0) == 0,
 		pendingCh:       make(chan *pendingItem, 100*config.MaxUpload),
 		pendingKeys:     make(map[string]*pendingItem),
+		stagingDirty:    make(map[string]*stagingDirtyBlock),
 		group:           NewController(),
 	}
 	if config.UploadLimit > 0 {
@@ -1060,6 +1105,12 @@ func (store *cachedStore) uploadStagingFile(key string, stagingPath string) {
 	}
 
 	blen := parseObjOrigSize(key)
+	if err := store.flushStagingDirty(key, stagingPath, blen); err != nil {
+		// Keep the in-memory dirty buffer and skip Put so we never upload a
+		// stale staging file after a successful PatchStaging.
+		logger.Errorf("flush dirty staging %s: %s; skip upload", key, err)
+		return
+	}
 	f, err := openCacheFile(stagingPath, blen, store.conf.CacheChecksum)
 	if err != nil {
 		if store.isPendingValid(key) {
@@ -1134,6 +1185,7 @@ func (store *cachedStore) removePending(key string) {
 	store.pendingMutex.Lock()
 	delete(store.pendingKeys, key)
 	store.pendingMutex.Unlock()
+	store.dropStagingDirty(key)
 }
 
 func (store *cachedStore) isPendingValid(key string) bool {
@@ -1141,6 +1193,131 @@ func (store *cachedStore) isPendingValid(key string) bool {
 	defer store.pendingMutex.Unlock()
 	_, ok := store.pendingKeys[key]
 	return ok
+}
+
+// PatchStaging applies overwrites to staging-resident objects without creating a
+// new meta slice. Dirty bytes are kept in memory and merged into the staging
+// file only when the block is uploaded (or explicitly flushed).
+func (store *cachedStore) PatchStaging(id uint64, size int, off int, data []byte) bool {
+	if !store.conf.Writeback || size <= 0 || off < 0 || len(data) == 0 || off+len(data) > size {
+		return false
+	}
+	rs := sliceForRead(id, size, store)
+	type job struct {
+		key  string
+		blen int
+		boff int
+		d    []byte
+		item *pendingItem
+	}
+	var jobs []job
+	for n := 0; n < len(data); {
+		indx := rs.index(off + n)
+		blen := rs.blockSize(indx)
+		boff := (off + n) % store.conf.BlockSize
+		take := len(data) - n
+		if boff+take > blen {
+			take = blen - boff
+		}
+		jobs = append(jobs, job{key: rs.key(indx), blen: blen, boff: boff, d: data[n : n+take]})
+		n += take
+	}
+
+	store.pendingMutex.Lock()
+	for i := range jobs {
+		it := store.pendingKeys[jobs[i].key]
+		if it == nil || it.uploading.Load() {
+			store.pendingMutex.Unlock()
+			return false
+		}
+		jobs[i].item = it
+	}
+	store.pendingMutex.Unlock()
+
+	for _, j := range jobs {
+		if err := store.patchStagingDirty(j.item, j.key, j.blen, j.boff, j.d); err != nil {
+			logger.Warnf("patch staging dirty %s: %s", j.key, err)
+			return false
+		}
+	}
+	return true
+}
+
+func (store *cachedStore) patchStagingDirty(item *pendingItem, key string, blen, boff int, d []byte) error {
+	store.stagingDirtyMu.Lock()
+	defer store.stagingDirtyMu.Unlock()
+	db := store.stagingDirty[key]
+	if db == nil {
+		buf := make([]byte, blen)
+		f, err := openCacheFile(item.fpath, blen, store.conf.CacheChecksum)
+		if err != nil {
+			return err
+		}
+		_, err = f.ReadAt(buf, 0)
+		_ = f.Close()
+		if err != nil {
+			return err
+		}
+		db = &stagingDirtyBlock{data: buf}
+		store.stagingDirty[key] = db
+	}
+	copy(db.data[boff:], d)
+	return nil
+}
+
+func (store *cachedStore) readStagingDirty(key string, p []byte, boff int) (int, bool) {
+	store.stagingDirtyMu.Lock()
+	db := store.stagingDirty[key]
+	if db == nil {
+		store.stagingDirtyMu.Unlock()
+		return 0, false
+	}
+	n := copy(p, db.data[boff:])
+	store.stagingDirtyMu.Unlock()
+	return n, true
+}
+
+// flushStagingDirty writes an in-memory dirty block back to the staging file
+// (and hard-linked cache inode) via pwrite, then drops the dirty entry.
+// On I/O failure the dirty buffer is retained so a later upload can retry.
+func (store *cachedStore) flushStagingDirty(key, stagingPath string, blen int) error {
+	store.stagingDirtyMu.Lock()
+	db := store.stagingDirty[key]
+	if db == nil {
+		store.stagingDirtyMu.Unlock()
+		return nil
+	}
+	data := db.data
+	store.stagingDirtyMu.Unlock()
+
+	f, err := os.OpenFile(stagingPath, os.O_RDWR, 0)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+	if _, err = f.WriteAt(data, 0); err != nil {
+		return err
+	}
+	if store.conf.CacheChecksum != CsNone && store.conf.CacheChecksum != "" {
+		sum := checksum(data)
+		if _, err = f.WriteAt(sum, int64(blen)); err != nil {
+			return err
+		}
+	}
+
+	store.stagingDirtyMu.Lock()
+	// Drop only if this is still the same buffer (no newer patch replaced it).
+	if cur := store.stagingDirty[key]; cur == db {
+		delete(store.stagingDirty, key)
+	}
+	store.stagingDirtyMu.Unlock()
+	return nil
+}
+
+func (store *cachedStore) dropStagingDirty(key string) {
+	store.stagingDirtyMu.Lock()
+	delete(store.stagingDirty, key)
+	store.stagingDirtyMu.Unlock()
 }
 
 func (store *cachedStore) scanDelayedStaging() {
@@ -1156,6 +1333,122 @@ func (store *cachedStore) scanDelayedStaging() {
 			store.pendingCh <- item
 		}
 		store.pendingMutex.Lock()
+	}
+}
+
+// FlushStaging force-uploads every staged block and waits for the pending queue
+// to drain. Used by the flush-staging control command.
+func (store *cachedStore) FlushStaging() error {
+	if !store.conf.Writeback {
+		return nil
+	}
+	_ = store.bcache.flushStaging()
+
+	store.pendingMutex.Lock()
+	items := make([]*pendingItem, 0, len(store.pendingKeys))
+	keys := make([]string, 0, len(store.pendingKeys))
+	for _, it := range store.pendingKeys {
+		items = append(items, it)
+		keys = append(keys, it.key)
+	}
+	store.pendingMutex.Unlock()
+	for _, it := range items {
+		store.enqueuePendingItem(it)
+	}
+	return store.waitStagingKeys(keys)
+}
+
+// FlushStagingObjects queues upload for specific staged slice objects.
+func (store *cachedStore) FlushStagingObjects(objs []StagingObject, wait bool) (int, error) {
+	if !store.conf.Writeback || len(objs) == 0 {
+		return 0, nil
+	}
+	seen := make(map[string]struct{})
+	var keys []string
+	queued := 0
+	for _, o := range objs {
+		if o.Id == 0 || o.Size <= 0 {
+			continue
+		}
+		rs := sliceForRead(o.Id, o.Size, store)
+		for _, indx := range rs.blockIndexes(nil) {
+			key := rs.key(indx)
+			if _, ok := seen[key]; ok {
+				continue
+			}
+			seen[key] = struct{}{}
+			keys = append(keys, key)
+			if store.forceEnqueueStaging(key) {
+				queued++
+			}
+		}
+	}
+	if !wait {
+		return queued, nil
+	}
+	return queued, store.waitStagingKeys(keys)
+}
+
+func (store *cachedStore) forceEnqueueStaging(key string) bool {
+	store.pendingMutex.Lock()
+	item := store.pendingKeys[key]
+	store.pendingMutex.Unlock()
+	if item != nil {
+		if err := store.flushStagingDirty(key, item.fpath, parseObjOrigSize(key)); err != nil {
+			logger.Warnf("flush dirty staging %s: %s", key, err)
+		}
+		return store.enqueuePendingItem(item)
+	}
+	store.dropStagingDirty(key)
+	return store.bcache.flushStagingKey(key)
+}
+
+func (store *cachedStore) enqueuePendingItem(item *pendingItem) bool {
+	if item == nil {
+		return false
+	}
+	if item.uploading.CompareAndSwap(false, true) {
+		select {
+		case store.pendingCh <- item:
+			return true
+		default:
+			// Channel full: block briefly so file-level flush still makes progress.
+			store.pendingCh <- item
+			return true
+		}
+	}
+	return true // already uploading
+}
+
+func (store *cachedStore) waitStagingKeys(keys []string) error {
+	if len(keys) == 0 {
+		return nil
+	}
+	want := make(map[string]struct{}, len(keys))
+	for _, k := range keys {
+		want[k] = struct{}{}
+	}
+	wait := store.conf.PutTimeout * time.Duration(store.conf.MaxRetries+2)
+	if wait < time.Minute {
+		wait = time.Minute
+	}
+	deadline := time.Now().Add(wait)
+	for {
+		store.pendingMutex.Lock()
+		left := 0
+		for k := range want {
+			if _, ok := store.pendingKeys[k]; ok {
+				left++
+			}
+		}
+		store.pendingMutex.Unlock()
+		if left == 0 {
+			return nil
+		}
+		if time.Now().After(deadline) {
+			return fmt.Errorf("%d staging blocks still pending after %s", left, wait)
+		}
+		time.Sleep(100 * time.Millisecond)
 	}
 }
 

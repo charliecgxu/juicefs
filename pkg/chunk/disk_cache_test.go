@@ -492,3 +492,56 @@ func TestSpaceToFreeNoAction(t *testing.T) {
 		require.Equal(t, 0, uploadCount, "should not upload when disk has enough free space and inodes")
 	})
 }
+
+func TestStageUsageWatermarkUpload(t *testing.T) {
+	PatchConvey("watermark starts upload above high and stops at low", t, func() {
+		dir := t.TempDir()
+		conf := defaultConf
+		conf.FreeSpace = 0.10
+		conf.StageUsageHigh = 0.80
+		conf.StageUsageLow = 0.70
+		conf.CacheEviction = EvictionNone
+
+		var uploadCount int
+		uploader := func(key, path string, force bool) bool {
+			uploadCount++
+			return true
+		}
+		s := newTestCacheStore(dir+"/", &conf, uploader)
+		s.stageUsageHigh = 0.80
+		s.stageUsageLow = 0.70
+		s.scanned = true
+
+		const capBytes uint64 = 100000
+		Mock(getDiskUsage).To(func(path string) (uint64, uint64, uint64, uint64) {
+			return capBytes, 50000, 100000, 50000 // plenty of free space
+		}).Build()
+
+		// Below high watermark: no upload.
+		s.stagedBytes.Store(75000) // 75%
+		s.updateStageUploadWatermark(capBytes)
+		require.False(t, s.stageUploadActive.Load())
+		s.uploadStaging()
+		require.Equal(t, 0, uploadCount)
+
+		// Cross high watermark.
+		s.stagedBytes.Store(85000) // 85%
+		for i := 0; i < 20; i++ {
+			key := fmt.Sprintf("chunks/0/0/%d_%d_1000", i, i)
+			k := s.getCacheKey(key)
+			s.keys.add(k, cacheItem{size: -1000, atime: uint32(time.Now().Unix()) - uint32(i)})
+		}
+		s.updateStageUploadWatermark(capBytes)
+		require.True(t, s.stageUploadActive.Load())
+		s.uploadStaging()
+		require.Greater(t, uploadCount, 0, "should upload when above high watermark")
+
+		// Drop to low watermark: stop.
+		s.stagedBytes.Store(65000) // 65%
+		s.updateStageUploadWatermark(capBytes)
+		require.False(t, s.stageUploadActive.Load())
+		before := uploadCount
+		s.uploadStaging()
+		require.Equal(t, before, uploadCount, "should not watermark-upload at/under low")
+	})
+}

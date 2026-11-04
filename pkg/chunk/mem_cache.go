@@ -210,5 +210,7 @@ func (c *memcache) stage(key string, data []byte, tierID uint8) (string, error) 
 	return "", errors.New("not supported")
 }
 func (c *memcache) uploaded(key string, size int)    {}
+func (c *memcache) flushStaging() int                { return 0 }
+func (c *memcache) flushStagingKey(string) bool      { return false }
 func (c *memcache) isEmpty() bool                    { return false }
 func (c *memcache) getMetrics() *cacheManagerMetrics { return c.metrics }

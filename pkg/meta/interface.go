@@ -57,6 +57,8 @@ const (
 	OpSummary = 1007
 	// CompactPath is a message to trigger compact
 	CompactPath = 1008
+	// FlushStaging is a message to force-upload writeback staging blocks.
+	FlushStaging = 1009
 )
 
 const (

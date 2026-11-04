@@ -86,6 +86,9 @@ type sliceWriter struct {
 
 	growing   bool
 	committed bool
+	// cancelled means a later write on this chunk fully covered this slice
+	// before it was committed; skip meta.Write and drop the data.
+	cancelled bool
 	dep       *sliceWriter
 }
 
@@ -129,10 +132,22 @@ func (s *sliceWriter) markDone() {
 // freezed, no more data
 func (s *sliceWriter) flushData() {
 	defer s.markDone()
-	if s.slen == 0 {
+	f := s.chunk.file
+	f.Lock()
+	cancelled := s.cancelled || s.slen == 0
+	f.Unlock()
+	if cancelled {
+		s.writer.Abort()
 		return
 	}
 	s.prepareID(meta.Background(), true)
+	f.Lock()
+	cancelled = s.cancelled
+	f.Unlock()
+	if cancelled {
+		s.writer.Abort()
+		return
+	}
 	if s.err != 0 {
 		logger.Infof("flush inode: %v chunk: %d err: %s", s.chunk.file.inode, s.id, s.err)
 		s.writer.Abort()
@@ -163,7 +178,11 @@ func (s *sliceWriter) write(ctx meta.Context, off uint32, data []uint8) syscall.
 		s.freezed = true
 		go s.flushData()
 	} else if int(s.slen) >= f.w.blockSize {
-		if s.id > 0 {
+		// In writeback mode, skip early FlushTo so pages stay in memory until the
+		// slice is frozen. Otherwise staging advances the uploaded watermark and
+		// later overwrites cannot reuse this slice (new meta slices). Finish() on
+		// freeze still stages/uploads as usual.
+		if s.id > 0 && (f.w.conf.Chunk == nil || !f.w.conf.Chunk.Writeback) {
 			err := s.writer.FlushTo(int(s.slen))
 			if err != nil {
 				logger.Warnf("write inode: %v chunk: %d off: %d %s", s.chunk.file.inode, s.id, off, err)
@@ -182,12 +201,20 @@ type chunkWriter struct {
 
 // protected by file
 func (c *chunkWriter) findWritableSlice(pos uint32, size uint32) *sliceWriter {
-	blockSize := uint32(c.file.w.blockSize)
 	for i := range c.slices {
 		s := c.slices[len(c.slices)-1-i]
+		if s.cancelled {
+			continue
+		}
 		if !s.freezed {
-			flushoff := s.slen / blockSize * blockSize
-			if pos >= s.off+flushoff && pos <= s.off+s.slen {
+			// Use the real upload watermark. Previously we used slen aligned to
+			// blockSize, which blocked overwrites of data still only in memory
+			// (e.g. before prepareID/FlushTo), creating many short-lived slices.
+			var uploaded uint32
+			if s.writer != nil {
+				uploaded = uint32(s.writer.Uploaded())
+			}
+			if pos >= s.off+uploaded && pos <= s.off+s.slen {
 				return s
 			} else if i > 3 {
 				s.freezed = true
@@ -195,12 +222,39 @@ func (c *chunkWriter) findWritableSlice(pos uint32, size uint32) *sliceWriter {
 			}
 		}
 		if pos < s.off+s.slen && s.off < pos+size {
-			// overlaped
-			// TODO: write into multiple slices
+			// overlapped with a freeze/committed-pending slice; caller must open a new one
 			return nil
 		}
 	}
 	return nil
+}
+
+// cancelFullyCovered marks uncommitted slices whose whole range is covered by
+// [off, off+size). Must not cancel `except` (the slice that just accepted the write).
+// protected by file
+func (c *chunkWriter) cancelFullyCovered(except *sliceWriter, off, size uint32) {
+	if size == 0 {
+		return
+	}
+	end := off + size
+	for _, s := range c.slices {
+		if s == except || s.committed || s.cancelled || s.slen == 0 {
+			continue
+		}
+		if s.off >= off && s.off+s.slen <= end {
+			s.cancelled = true
+			logger.Debugf("cancel covered slice inode:%d chunk:%d off:%d len:%d by [%d,%d)",
+				c.file.inode, c.indx, s.off, s.slen, off, end)
+			if !s.freezed {
+				s.freezed = true
+				s.writer.Abort()
+				s.length = 0
+				s.done = true
+				s.notify.Signal()
+			}
+			// if already flushing/freezed, flushData/commitThread will observe cancelled
+		}
+	}
 }
 
 func (c *chunkWriter) commitThread() {
@@ -212,13 +266,29 @@ func (c *chunkWriter) commitThread() {
 	for len(c.slices) > 0 {
 		s := c.slices[0]
 		for !s.done {
-			if s.notify.WaitWithTimeout(time.Millisecond*100) && !s.freezed && time.Since(s.started) > flushDuration*2 {
+			if s.notify.WaitWithTimeout(time.Millisecond*100) && !s.freezed && !s.cancelled && time.Since(s.started) > flushDuration*2 {
 				s.freezed = true
 				go s.flushData()
 			}
 		}
 		for s.dep != nil && !s.dep.committed {
 			f.commitcond.WaitWithTimeout(time.Millisecond * 100)
+		}
+		if s.cancelled {
+			id, length := s.id, int(s.length)
+			s.committed = true
+			if s.growing {
+				f.commitcond.Broadcast()
+			}
+			c.slices = c.slices[1:]
+			f.Unlock()
+			if id > 0 && length > 0 {
+				_ = f.w.store.Remove(id, length)
+			} else if s.writer != nil {
+				s.writer.Abort()
+			}
+			f.Lock()
+			continue
 		}
 		err := s.err
 		f.Unlock()
@@ -288,11 +358,72 @@ func (f *fileWriter) freeChunk(c *chunkWriter) {
 	}
 }
 
+// hasPendingOverlap reports whether any non-cancelled in-flight slice overlaps
+// [off, off+size). Protected by file.
+func (c *chunkWriter) hasPendingOverlap(off, size uint32) bool {
+	if size == 0 {
+		return false
+	}
+	end := off + size
+	for _, s := range c.slices {
+		if s.cancelled || s.slen == 0 {
+			continue
+		}
+		if off < s.off+s.slen && s.off < end {
+			return true
+		}
+	}
+	return false
+}
+
+// tryOverwriteStaging patches writeback staging for a committed meta slice so
+// the overwrite does not append another meta slice. Protected by file.
+func (f *fileWriter) tryOverwriteStaging(ctx meta.Context, indx, off uint32, data []byte) bool {
+	if f.w.conf.Chunk == nil || !f.w.conf.Chunk.Writeback || len(data) == 0 {
+		return false
+	}
+	var slices []meta.Slice
+	if st := f.w.m.Read(ctx, f.inode, indx, &slices); st != 0 || len(slices) == 0 {
+		return false
+	}
+	end := off + uint32(len(data))
+	var pos uint32
+	for _, s := range slices {
+		next := pos + s.Len
+		if off >= pos && end <= next {
+			if s.Id == 0 {
+				return false
+			}
+			objOff := int(s.Off + (off - pos))
+			if !f.w.store.PatchStaging(s.Id, int(s.Size), objOff, data) {
+				return false
+			}
+			f.w.reader.Invalidate(f.inode, uint64(indx)*meta.ChunkSize+uint64(off), uint64(len(data)))
+			return true
+		}
+		if off < next && end > pos {
+			return false
+		}
+		pos = next
+	}
+	return false
+}
+
 // protected by file
 func (f *fileWriter) writeChunk(ctx meta.Context, indx uint32, off uint32, data []byte) syscall.Errno {
 	c := f.findChunk(indx)
 	s := c.findWritableSlice(off, uint32(len(data)))
 	if s == nil {
+		// Data still only in local staging (writeback, not yet Put): rewrite in
+		// place instead of appending a new meta slice.
+		if !c.hasPendingOverlap(off, uint32(len(data))) && f.tryOverwriteStaging(ctx, indx, off, data) {
+			// findChunk may have inserted an empty chunk; drop it so flush
+			// does not wait forever for a commitThread that was never started.
+			if len(c.slices) == 0 {
+				f.freeChunk(c)
+			}
+			return 0
+		}
 		s = &sliceWriter{
 			chunk:   c,
 			off:     off,
@@ -330,7 +461,12 @@ func (f *fileWriter) writeChunk(ctx meta.Context, indx uint32, off uint32, data 
 	if !s.growing && uint64(indx)*meta.ChunkSize+uint64(off)+uint64(len(data)) > f.length {
 		s.growing = true
 	}
-	return s.write(ctx, off-s.off, data)
+	st := s.write(ctx, off-s.off, data)
+	if st == 0 {
+		// Single-writer friendly: drop uncommitted slices fully hidden by this write.
+		c.cancelFullyCovered(s, off, uint32(len(data)))
+	}
+	return st
 }
 
 func (f *fileWriter) totalSlices() int {

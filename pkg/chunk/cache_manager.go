@@ -97,6 +97,8 @@ type CacheManager interface {
 	uploaded(key string, size int)
 	stage(key string, data []byte, tierID uint8) (string, error)
 	removeStage(key string) error
+	flushStaging() int
+	flushStagingKey(key string) bool
 	stats() (int64, int64)
 	usedMemory() int64
 	isEmpty() bool
@@ -216,6 +218,26 @@ func (m *cacheManager) removeStage(key string) error {
 	} else {
 		return s.removeStage(key)
 	}
+}
+
+func (m *cacheManager) flushStaging() int {
+	var n int
+	m.Lock()
+	stores := append([]*diskCache(nil), m.stores...)
+	m.Unlock()
+	for _, s := range stores {
+		if s != nil {
+			n += s.forceUploadAllStaging()
+		}
+	}
+	return n
+}
+
+func (m *cacheManager) flushStagingKey(key string) bool {
+	if s := m.getStore(key); s != nil {
+		return s.flushStagingKey(key)
+	}
+	return false
 }
 
 // Deprecated: use getStore instead
