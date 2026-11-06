@@ -1,0 +1,4486 @@
+diff --git a/cmd/config.go b/cmd/config.go
+index 645dcbdc59f1fb9fa03033640b79ec2a268f1e7b..794e267f2c5095a39f1d88295db0ff1eac4cb526 100644
+--- a/cmd/config.go
++++ b/cmd/config.go
+@@ -97,6 +97,10 @@ func configManagementFlags() []cli.Flag {
+ 			Usage: "enable user and group quota management",
+ 		},
+ 		&cli.BoolFlag{
++			Name:  "enable-sparse-chunk",
++			Usage: "enable the incompatible packed sparse chunk format",
++		},
++		&cli.BoolFlag{
+ 			Name:  "changelog",
+ 			Usage: "enable changelog",
+ 		},
+@@ -179,7 +183,7 @@ func config(ctx *cli.Context) error {
+ 
+ 	originDirStats := format.DirStats
+ 	originUGQuota := format.UserGroupQuota
+-	var quota, storage, trash, clientVer, tier bool
++	var quota, storage, trash, clientVer, tier, metaVersionUpgrade bool
+ 	var msg strings.Builder
+ 	encrypted := format.KeyEncrypted
+ 	var targetTierID uint8
+@@ -345,6 +349,15 @@ func config(ctx *cli.Context) error {
+ 				msg.WriteString(fmt.Sprintf("%10s: %t -> %t\n", flag, format.UserGroupQuota, new))
+ 				format.UserGroupQuota = new
+ 			}
++		case "enable-sparse-chunk":
++			if !ctx.Bool(flag) {
++				return errors.New("cannot disable packed sparse chunk format")
++			}
++			if format.MetaVersion < meta.SparseFormatVersion {
++				msg.WriteString(fmt.Sprintf("%10s: metadata format %d -> %d\n", flag, format.MetaVersion, meta.SparseFormatVersion))
++				format.MetaVersion = meta.SparseFormatVersion
++				metaVersionUpgrade = true
++			}
+ 		case "min-client-version":
+ 			if new := ctx.String(flag); new != format.MinClientVersion {
+ 				if version.Parse(new) == nil {
+@@ -539,7 +552,7 @@ func config(ctx *cli.Context) error {
+ 			logger.Fatalf("Format encrypt: %s", err)
+ 		}
+ 	}
+-	if err = m.Init(format, false); err == nil {
++	if err = m.Init(format, metaVersionUpgrade); err == nil {
+ 		fmt.Println(msg.String()[:msg.Len()-1])
+ 	}
+ 
+diff --git a/cmd/flags.go b/cmd/flags.go
+index 72b78dea67d6b0663fade96faabe4e5ac2299049..bc772ddbfe5726e051d0f90655bd9ea11000b7f7 100644
+--- a/cmd/flags.go
++++ b/cmd/flags.go
+@@ -251,6 +251,15 @@ func dataCacheFlags() []cli.Flag {
+ 			Value: 0.1,
+ 			Usage: "min free space (ratio)",
+ 		},
++		&cli.Float64Flag{
++			Name:  "stage-usage-high-ratio",
++			Value: 0.8,
++			Usage: "publish sparse staging when staged data / cache capacity reaches this ratio (0 disables)",
++		},
++		&cli.BoolFlag{
++			Name:  "sparse-chunk-slice",
++			Usage: "stage one sparse 64 MiB generation per inode/chunk (requires writeback)",
++		},
+ 		&cli.BoolFlag{
+ 			Name:  "cache-partial-only",
+ 			Usage: "cache only random/small read",
+diff --git a/cmd/flush_staging.go b/cmd/flush_staging.go
+new file mode 100644
+index 0000000000000000000000000000000000000000..7d90bf9b6e589f8b2166ae95f704509aabf542f8
+--- /dev/null
++++ b/cmd/flush_staging.go
+@@ -0,0 +1,167 @@
++/*
++ * JuiceFS, Copyright 2026 Juicedata, Inc.
++ *
++ * Licensed under the Apache License, Version 2.0 (the "License");
++ * you may not use this file except in compliance with the License.
++ * You may obtain a copy of the License at
++ *
++ *     http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++package cmd
++
++import (
++	"encoding/json"
++	"fmt"
++	"os"
++	"path/filepath"
++	"strings"
++	"syscall"
++	"time"
++
++	"github.com/juicedata/juicefs/pkg/meta"
++	"github.com/juicedata/juicefs/pkg/utils"
++	"github.com/juicedata/juicefs/pkg/vfs"
++	"github.com/urfave/cli/v2"
++)
++
++func cmdFlushStaging() *cli.Command {
++	return &cli.Command{
++		Name:      "flush-staging",
++		Aliases:   []string{"flush2"},
++		Action:    flushStaging,
++		Category:  "TOOL",
++		Usage:     "Publish sparse staging generations for files",
++		ArgsUsage: "PATH ...",
++		Description: `
++Publish local sparse staging generations belonging to the given files or
++directories. By default the request is asynchronous.
++
++With only the mount point, all sparse staging generations are published.
++
++Examples:
++# Async flush one file (default)
++$ juicefs flush-staging /mnt/jfs/data/a.bin
++
++# Async flush a directory tree
++$ juicefs flush-staging /mnt/jfs/data/
++
++# Wait until uploads finish
++$ juicefs flush-staging --wait /mnt/jfs/data/a.bin
++
++# Flush everything under the volume (async)
++$ juicefs flush2 /mnt/jfs`,
++		Flags: []cli.Flag{
++			&cli.BoolFlag{
++				Name:    "background",
++				Aliases: []string{"b"},
++				Value:   true,
++				Usage:   "run asynchronously (default true)",
++			},
++			&cli.BoolFlag{
++				Name:  "wait",
++				Usage: "wait until staging uploads finish (overrides --background)",
++			},
++		},
++	}
++}
++
++func flushStaging(ctx *cli.Context) error {
++	setup0(ctx, 1, 0)
++	args := ctx.Args().Slice()
++	if len(args) == 0 {
++		return fmt.Errorf("PATH is required")
++	}
++
++	var absPaths []string
++	for _, p := range args {
++		abs, err := filepath.Abs(p)
++		if err != nil {
++			return fmt.Errorf("abs path %q: %s", p, err)
++		}
++		absPaths = append(absPaths, abs)
++	}
++
++	controller, err := openController(absPaths[0])
++	if err != nil {
++		return fmt.Errorf("open control file for %s: %s", absPaths[0], err)
++	}
++	defer controller.Close()
++
++	mp := absPaths[0]
++	for ; mp != "/"; mp = filepath.Dir(mp) {
++		inode, err := utils.GetFileInode(mp)
++		if err != nil {
++			return fmt.Errorf("lookup inode for %q: %s", mp, err)
++		}
++		if inode == uint64(meta.RootInode) {
++			break
++		}
++	}
++
++	// Rewrite to volume-relative paths. Mount point alone → empty list = flush all.
++	var rel []string
++	for _, p := range absPaths {
++		if p == mp || p == mp+"/" {
++			continue
++		}
++		if mp == "/" {
++			ino, err := utils.GetFileInode(p)
++			if err != nil {
++				logger.Warnf("lookup %q: %s", p, err)
++				continue
++			}
++			rel = append(rel, fmt.Sprintf("inode:%d", ino))
++			continue
++		}
++		if !strings.HasPrefix(p, mp+"/") && p != mp {
++			logger.Warnf("skip %q: not under mount point %s", p, mp)
++			continue
++		}
++		rel = append(rel, strings.TrimPrefix(p, mp))
++	}
++
++	background := ctx.Bool("background") && !ctx.Bool("wait")
++	pathsBlob := strings.Join(rel, "\n")
++	bodyLen := uint32(4 + len(pathsBlob) + 1)
++	wb := utils.NewBuffer(8 + bodyLen)
++	wb.Put32(meta.FlushStaging)
++	wb.Put32(bodyLen)
++	wb.Put32(uint32(len(pathsBlob)))
++	wb.Put([]byte(pathsBlob))
++	if background {
++		wb.Put8(1)
++	} else {
++		wb.Put8(0)
++	}
++
++	if _, err := controller.Write(wb.Bytes()); err != nil {
++		return fmt.Errorf("write flush-staging command: %s", err)
++	}
++
++	start := time.Now()
++	data, errno := readProgress(controller, func(_, _ uint64) {})
++	if errno != 0 {
++		return fmt.Errorf("flush-staging failed: %s", syscall.Errno(errno))
++	}
++	var resp vfs.FlushStagingResponse
++	if len(data) > 0 {
++		if err := json.Unmarshal(data, &resp); err != nil {
++			return fmt.Errorf("decode response: %s", err)
++		}
++	}
++	if background || resp.Async {
++		fmt.Printf("flush-staging scheduled (async): files=%d slices=%d paths=%d\n",
++			resp.FileCount, resp.SliceCount, len(rel))
++		return nil
++	}
++	fmt.Fprintf(os.Stdout, "flush-staging done in %s: files=%d slices=%d\n",
++		time.Since(start).Truncate(time.Millisecond), resp.FileCount, resp.SliceCount)
++	return nil
++}
+diff --git a/cmd/format.go b/cmd/format.go
+index 70100471dabcb4ff497dc28646dc2dc4fc273fba..f3f3e2307a973ba3be79bd040ddf26148948fc11 100644
+--- a/cmd/format.go
++++ b/cmd/format.go
+@@ -546,7 +546,7 @@ func format(c *cli.Context) error {
+ 			TrashDays:        c.Int("trash-days"),
+ 			DirStats:         true,
+ 			UserGroupQuota:   false,
+-			MetaVersion:      meta.MaxVersion,
++			MetaVersion:      meta.DefaultFormatVersion,
+ 			MinClientVersion: "1.1.0-A",
+ 			EnableACL:        c.Bool("enable-acl"),
+ 			RangerRestUrl:    c.String("ranger-rest-url"),
+diff --git a/cmd/main.go b/cmd/main.go
+index be2ebc101a634bd075cf6cee6f3f9ec8d42281ba..cbf5bfcd5553e60d8c922430732452a7d498f6dd 100644
+--- a/cmd/main.go
++++ b/cmd/main.go
+@@ -80,6 +80,7 @@ func Main(args []string) error {
+ 			cmdObjbench(),
+ 			cmdMdtest(),
+ 			cmdWarmup(),
++			cmdFlushStaging(),
+ 			cmdRmr(),
+ 			cmdSync(),
+ 			cmdDebug(),
+diff --git a/cmd/mount.go b/cmd/mount.go
+index f18f551979befbeecd3d1f1c0829d297ce6bb0c7..3afdaf8b37090ccb3d4936972f026a8fb1d52160 100644
+--- a/cmd/mount.go
++++ b/cmd/mount.go
+@@ -369,6 +369,9 @@ func getMetaConf(c *cli.Context, mp string, readOnly bool) *meta.Config {
+ }
+ 
+ func getChunkConf(c *cli.Context, format *meta.Format) *chunk.Config {
++	if c.Bool("sparse-chunk-slice") && format.Name != "" && format.MetaVersion < meta.SparseFormatVersion {
++		logger.Fatalf("sparse-chunk-slice requires metadata format %d; run `juicefs config META-URL --enable-sparse-chunk` first", meta.SparseFormatVersion)
++	}
+ 	cm, err := strconv.ParseUint(c.String("cache-mode"), 8, 32)
+ 	if err != nil {
+ 		logger.Warnf("Invalid cache-mode %q, using default value 0600", c.String("cache-mode"))
+@@ -398,6 +401,8 @@ func getChunkConf(c *cli.Context, format *meta.Format) *chunk.Config {
+ 		CacheSize:         utils.ParseBytes(c, "cache-size", 'M'),
+ 		CacheItems:        c.Int64("cache-items"),
+ 		FreeSpace:         float32(c.Float64("free-space-ratio")),
++		StageUsageHigh:    float32(c.Float64("stage-usage-high-ratio")),
++		SparseChunkSlice:  c.Bool("sparse-chunk-slice"),
+ 		CacheMode:         os.FileMode(cm),
+ 		CacheFullBlock:    !c.Bool("cache-partial-only"),
+ 		CacheLargeWrite:   c.Bool("cache-large-write"),
+diff --git a/docs/en/guide/cache.md b/docs/en/guide/cache.md
+index 7cada19b51b848378e5120d7df9367be3e693de6..98b547b7f400ec845d4ef409198cb05bd282aba3 100644
+--- a/docs/en/guide/cache.md
++++ b/docs/en/guide/cache.md
+@@ -198,6 +198,14 @@ Add `--writeback` to the mount command to enable client write cache, but this mo
+ 
+ Improper usage of client write cache can easily cause problems, that's why only recommend to temporarily enable this when writing large number of small files (e.g. extracting a compressed file containing a large number of small files).
+ 
++#### Experimental sparse controlled staging
++
++`--sparse-chunk-slice` is an experimental, opt-in extension of `--writeback`. Random writes overwrite one sparse local 64 MiB generation per file chunk. The first `fsync`, `flush`, or close checkpoints it locally and registers one stable metadata slice; later syncs idempotently reuse that record instead of appending slices. `juicefs flush-staging` only uploads the packed payload and manifest. A staging high watermark can also trigger upload.
++
++Before the first sparse mount, irreversibly upgrade the volume format with `juicefs config META-URL --enable-sparse-chunk`. This raises the metadata format version so that community clients without packed-sparse support reject the volume instead of misreading it. Until Put completes, the registered sparse slice has no remote manifest and must not be read from another client. This mode is therefore limited to workloads that enforce a single writer and control cross-client read timing.
++
++Truncate, fallocate, and copy-file-range are rejected. Sparse compaction and `juicefs gc` object accounting are not implemented yet, and sparse payloads currently bypass normal block compression, upload throttling, and tier selection.
++
+ When `--writeback` is enabled, apart from checking `/var/jfsCache/<UUID>/rawstaging/` directly, you can also view upload progress using:
+ 
+ ```shell
+diff --git a/docs/zh_cn/development/sparse_controlled_staging.md b/docs/zh_cn/development/sparse_controlled_staging.md
+new file mode 100644
+index 0000000000000000000000000000000000000000..7410eaa7702c0416b35cc461a149c43501794f5e
+--- /dev/null
++++ b/docs/zh_cn/development/sparse_controlled_staging.md
+@@ -0,0 +1,317 @@
++# 稀疏可控暂存设计与实现
++
++本文描述 `opt2` 分支中 `--sparse-chunk-slice` 的设计目标、磁盘与对象格式、
++读写流程、故障语义和当前限制。本文以当前代码为准，不代表社区版 JuiceFS 的行为。
++相对社区版的逐项代码变更参见
++[稀疏暂存优化相对社区版的代码变更说明](sparse_staging_community_diff.md)。
++
++## 背景
++
++社区版按不可变 slice 写入数据。随机小写会不断创建 slice，并更新中心元数据；
++slice 达到一定数量后还会触发 compact。这个模型具有良好的多客户端可见性，但在
++单写者、频繁随机覆盖的场景中会产生以下开销：
++
++- 每次小写都可能创建 slice、对象和中心元数据记录；
++- compact 需要重新读取、合并和上传数据；
++- 只修改少量 4 KiB 页面也可能造成较大的写放大；
++- 写入路径依赖对象存储延迟和中心元数据延迟。
++
++本实现针对以下受约束的工作负载：
++
++- 同一文件在一次发布周期内只有一个写者；
++- 应用负责决定何时发布（Put）；
++- 发布完成前，其他客户端不会读取该文件的新数据；
++- `fsync` 要求本地暂存持久化并登记中心元数据，但不要求数据可被其他客户端读取；
++- 可以在暂存空间达到高水位时执行保护性发布。
++
++这些约束目前没有由 JuiceFS 强制实施。违反约束可能导致其他客户端读到旧数据，
++或者多个写者之间发生最后写入者覆盖。
++
++## 设计目标
++
++1. 一个发布周期内，每个 `(inode, 64 MiB chunk)` 通常只有一个本地 generation。
++2. 对同一 generation 的随机写直接覆盖本地暂存文件，不创建新的中心 slice。
++3. 未写入的页面始终保持为洞，不在本地和对象存储中填零占用空间。
++4. `fsync` 后，同一节点重启可以从本地暂存目录恢复数据和位图。
++5. 首次 `fsync` 登记一个稳定的中心 slice，后续 `fsync` 幂等复用；发布只上传对象。
++6. 已发布对象保持不可变；发布期间的新写进入新的 active generation。
++7. 未启用该功能时保持社区版写入行为。
++
++## 非目标
++
++当前实现不提供：
++
++- 发布前的跨客户端可见性；
++- 本地暂存盘损坏或丢失后的数据恢复；
++- 多写者冲突检测或分布式写锁；
++- sparse generation 的 compact；
++- sparse 对象的完整 GC 计费和扫描；
++- `truncate`、`fallocate` 和 `copy_file_range` 支持。
++- Put 前对文件执行 metadata clone；clone 共享 slice ID，但新 inode 不共享原 inode
++  的本地 staging overlay，必须先完成 Put。
++
++## 启用方式
++
++该功能会引入社区客户端无法识别的对象格式，必须先执行一次不可逆的格式升级：
++
++```shell
++juicefs config META-URL --enable-sparse-chunk
++```
++
++随后挂载时启用 writeback 和稀疏 chunk slice：
++
++```shell
++juicefs mount META-URL MOUNTPOINT \
++  --writeback \
++  --sparse-chunk-slice \
++  --cache-dir /path/to/cache
++```
++
++`--sparse-chunk-slice` 要求磁盘 cache，不能使用纯内存 cache。元数据格式从版本 1
++升级到版本 2，使不支持 packed sparse slice 的旧客户端拒绝挂载，而不是错误解析。
++
++显式发布使用：
++
++```shell
++# 异步发布指定文件
++juicefs flush-staging MOUNTPOINT/path/to/file
++
++# 等待上传和元数据发布完成
++juicefs flush-staging --wait MOUNTPOINT/path/to/file
++
++# 发布该挂载点的全部暂存数据
++juicefs flush-staging --wait MOUNTPOINT
++```
++
++## 核心模型
++
++### Generation
++
++每个 generation 对应一个 inode 的一个 64 MiB chunk，包含：
++
++- inode 和 chunk index；
++- 带稀疏标记的唯一 slice ID；
++- 文件写入前后的 EOF；
++- 4 KiB 粒度的 data bitmap；
++- 4 KiB 粒度的 zero bitmap；
++- 本地 `.stage` 文件；
++- active 或 frozen 状态。
++
++页面状态有三种：
++
++- `inherit`：两个 bitmap 都未置位，读取时继承更老的 generation 或旧 slice；
++- `data`：data bitmap 置位，页面内容保存在暂存文件或 packed payload 中；
++- `zero`：zero bitmap 置位，页面逻辑内容为零，但不保存 4 KiB 零数据。
++
++一个 chunk 共 16384 个 4 KiB 页面，因此每个位图占 2048 字节。
++
++### Active 与 pending
++
++正常写入复用 active generation。发布开始时，active generation 被 checkpoint 并
++冻结，然后移入 pending。这样发布不可变快照的同时，后续写入可以创建新的 active
++generation。pending 按 slice ID 顺序发布，以保持覆盖顺序。
++
++只要应用在一次发布完成前不继续写，通常一个 chunk 只有一个 generation 和一个
++最终的全局 sparse slice。跨越多次发布后会产生多个不可变 sparse slice；当前尚未
++实现它们之间的 compact。
++
++## 本地 `.stage` 文件格式
++
++暂存文件位于第一个 cache 目录下的 `sparse-staging/`：
++
++```text
++<inode>-<chunk-index>-<sparse-slice-id>.stage
++```
++
++文件布局如下：
++
++```text
++0                  8 KiB                16 KiB
+++-------------------+-------------------+--------------------------+
++| header slot 0     | header slot 1     | 64 MiB sparse data area  |
+++-------------------+-------------------+--------------------------+
++```
++
++文件逻辑长度是 `16 KiB + 64 MiB`，但数据区通过按偏移写入保持稀疏。没有写过的
++页面是文件系统洞，不占用对应的物理空间。
++
++每个 8 KiB header slot 保存：
++
++- magic 和格式版本；
++- frozen 标记；
++- 单调递增 sequence；
++- inode、chunk index 和 sparse slice ID；
++- logical size、base EOF 和 real EOF；
++- mtime；
++- data bitmap 和 zero bitmap；
++- CRC32。
++
++两个 header slot 交替写入。恢复时校验 magic、版本和 CRC，并选择 sequence 最大的
++有效 header。这样即使写 header 时掉电，通常仍可使用上一个完整 checkpoint。
++
++本实现没有逐写 journal。普通 `write` 只更新数据区和内存位图；`fsync`、`flush`
++或 `close` 才执行 checkpoint：
++
++1. `fsync` 暂存文件，使数据页先持久化；
++2. 将新 header 写入另一个 slot；
++3. 再次 `fsync` 暂存文件；
++4. `fsync` 暂存目录。
++
++因此，最后一次成功 checkpoint 之后、下一次 checkpoint 之前的写入在故障后可能
++丢失，这与 `fsync` 的边界一致。
++
++## 写入流程
++
++写入由 `pkg/vfs/sparse_staging.go` 处理：
++
++1. 根据文件偏移定位 64 MiB chunk。
++2. 查找该 `(inode, chunk)` 的 active generation；不存在时分配 sparse slice ID
++   并创建 `.stage` 文件。
++3. 对完整且对齐的 4 KiB 页面直接执行覆盖写，不读取旧页面。
++4. 对非完整页面执行 read-modify-write：
++   - 当前 generation 已包含该页面时，从 `.stage` 读取；
++   - 页面为 zero 时以零为基础；
++   - 否则从中心元数据表示的旧数据和 pending generation 合成基础页。
++5. 全零页面只设置 zero bitmap；非零页面写入数据区并设置 data bitmap。
++6. 更新内存中的 EOF 和 mtime。
++
++部分页写入必须先读取旧页面，因为 POSIX 写语义要求保留此次写入范围之外的旧字节。
++完整 4 KiB 覆盖不存在这个开销。
++
++普通写入不会立即更新中心元数据。`fsync`、`flush` 或 `close` checkpoint 成功后，
++使用稳定的 sparse slice ID 调用 `WriteEOF`：首次调用登记一条覆盖完整 chunk 的
++slice，后续调用只更新 EOF 和时间戳，不追加重复 slice。Redis、SQL 和 TKV 后端都
++校验重复 ID 的记录内容必须一致，否则返回 `EINVAL`。
++
++## 本地读取
++
++同一挂载点读取时：
++
++1. 先按中心元数据读取已发布数据；仍存在于本地 staging 的 sparse ID 暂不从对象
++   存储读取；
++2. 再按 generation 顺序覆盖 pending 和 active 的本地页面；
++3. inherit 页面保留基础数据，zero 页面清零，data 页面从 `.stage` 读取。
++
++因此，写后本地读可以看到未发布内容。中心元数据在 `fsync` 后已经包含新 ID 和
++EOF，但对应 manifest 在 Put 前并不存在；其他客户端此时读取会失败，而不是静默
++返回旧数据。应用必须遵守“Put 完成前其他客户端不读取”的约束。
++
++## 重启恢复
++
++挂载初始化时扫描 `sparse-staging/*.stage`：
++
++1. 检查文件逻辑长度；
++2. 读取并校验两个 header slot；
++3. 选择 sequence 最大的有效 checkpoint；
++4. 根据 frozen 标记恢复到 active 或 pending；
++5. 同一 key 出现多个 active 时，ID 最大的保留为 active，其余转为 pending。
++
++恢复依赖同一个 cache 目录及其完整内容。尚未 checkpoint 的首次 generation 没有
++有效 header，恢复时会被删除。`fsync` 成功后，只要本地 staging 盘仍可用，数据、
++位图和本地 EOF 可以恢复。恢复时还会用相同 ID 幂等登记中心元数据；如果 inode
++已经被删除，则把该 stage 视为过期文件并清理。
++
++## 发布流程
++
++`flush-staging` 调用发布逻辑：
++
++1. 将匹配 inode 的 active generation 标记为 frozen；
++2. checkpoint、幂等登记中心元数据并移入 pending；
++3. 将所有 data 页面按页号顺序打包上传；
++4. 上传 sparse manifest；
++5. 使本地读缓存失效；
++6. 从 pending 移除 generation，并删除对应 `.stage` 文件。
++
++Put 不再追加或修改 slice 记录，只负责把该 ID 对应的 payload 和 manifest 上传。
++上传失败时本地 generation 保留并可重试。由于 slice 在 `fsync` 已经登记，Put 前
++远端客户端不能读取它；这是本模式依赖应用访问时序换取简单、低延迟写路径的明确
++一致性边界。
++
++除了显式命令，暂存数据量达到
++`cache-size * stage-usage-high-ratio` 时也会异步调用全量发布。将
++`--stage-usage-high-ratio` 设为 `0` 可以关闭该保护机制。
++
++## 对象存储格式
++
++Sparse slice ID 使用正整数的 bit 62 作为格式标记。去掉该位后仍是正常分配的
++slice ID，因此不会占用 signed 64-bit SQL 字段的符号位。
++
++### Payload
++
++只有 data bitmap 中置位的页面会上传。页面按逻辑页号升序紧密排列，每个 payload
++part 最大 4 MiB。inherit 页面和 zero 页面都不占 payload 空间。
++
++对象 key 以 `<slice-id>_sparse` 为前缀，payload part 的 key 还包含 part 编号和
++实际大小。
++
++### Manifest
++
++manifest 保存：
++
++- magic 和版本；
++- 4 KiB page size；
++- 逻辑 chunk size；
++- 4 MiB payload part size；
++- data bitmap 和 zero bitmap；
++- 每个 payload part 的实际大小；
++- CRC32。
++
++读取 manifest 时会构建 data bitmap 的字节级 prefix rank。读取某个逻辑页面时，
++通过 rank 在 O(1) 时间内计算其 packed payload 偏移，避免每次从 bitmap 起点扫描。
++
++## 全局读取与 overlay
++
++普通 JuiceFS `buildSlice` 会消除被新 slice 覆盖的旧范围。Sparse slice 的 inherit
++页面却需要继续读取更老的数据，因此元数据层新增了 overlay 读取形式，保留持久化
++写入顺序和每条 slice 的 chunk 位置。
++
++当 chunk 含 sparse slice 时：
++
++1. 元数据层返回有序 overlay records；
++2. 读取器按顺序应用 dense slice、sparse data 和 sparse zero；
++3. sparse inherit 页面不修改已有结果；
++4. 单 sparse slice 且请求按 4 KiB 对齐时走批量快速路径，直接读入目标 buffer。
++
++manifest 和 prefix rank 会在内存中缓存。当前 sparse chunk 会跳过社区版 dense
++compact，因为 dense compact 不理解 inherit 语义。
++
++## 元数据与兼容性
++
++中心元数据中的 slice 记录格式没有增加字段。Sparse slice 通过 ID bit 62 区分，
++其 `Len` 和 `Size` 都使用完整 64 MiB；`Size` 是删除回调和格式识别使用的稳定逻辑
++值，不代表 manifest 加 payload 的物理大小。
++`WriteEOF` 单独传递真实文件 EOF，避免 64 MiB 逻辑覆盖错误扩展文件长度。
++
++dump、backup 和 replay 在计算 next slice ID 时会去掉 sparse 标记位。
++
++元数据格式版本 2 是兼容性边界：
++
++- 新客户端可以识别 sparse ID、manifest 和 overlay；
++- 未修改的社区客户端不应挂载格式版本 2；
++- 格式升级不能通过命令回退。
++
++## 故障与一致性语义
++
++- `write` 成功但没有 `fsync`：进程或节点故障后允许丢失最近写入。
++- `fsync` 成功：同一 cache 目录可恢复本地数据，中心元数据已有稳定 slice 和 EOF；
++  不保证远端对象存在。
++- 节点及其 staging 盘同时丢失：未发布数据无法恢复。
++- 发布前其他客户端读取：看到元数据但因 manifest 尚未上传而失败。
++- 对象上传中故障：本地 stage 和中心 slice 保留，重试使用相同对象 key。
++- Put 成功：其他支持格式版本 2 的客户端可以读取新 generation。
++- inode 最后一条链接删除后，常规 `DeleteSlice` 链路会同时清理未上传 `.stage`
++  和该 ID 前缀下可能存在的 manifest、payload 或部分上传对象；open-unlink 仍遵循
++  社区版 sustained inode 语义，等最后一个打开句柄关闭后再清理。
++
++## 当前限制与后续工作
++
++1. 实现 sparse-aware compact，合并多次发布产生的 generation，同时保留洞。
++2. 将 sparse manifest 和 payload 纳入 `juicefs gc` 引用扫描及空间统计。
++3. 接入常规 block compression、上传限速和 tier 选择。
++4. 实现安全的 truncate、fallocate 和 copy-file-range 语义。
++5. 增加多写者保护，或明确实现租约/冲突检测。
++6. 增加暂存盘故障、发布中断和多 generation 的故障注入测试。
++7. 如需解除 Put 前禁止跨客户端读取的约束，应增加独立的中心“本地暂存状态”或
++   两阶段可见性协议。
++
++在这些工作完成前，该功能应保持实验性并仅用于满足本文约束的工作负载。
+diff --git a/docs/zh_cn/development/sparse_staging_community_diff.md b/docs/zh_cn/development/sparse_staging_community_diff.md
+new file mode 100644
+index 0000000000000000000000000000000000000000..defe06ec2854435bec7df95b51406da23a270fb0
+--- /dev/null
++++ b/docs/zh_cn/development/sparse_staging_community_diff.md
+@@ -0,0 +1,777 @@
++# 稀疏暂存优化相对社区版的代码变更说明
++
++本文逐项说明 `opt2` 分支相对 JuiceFS 社区版 `main` 的代码变化、设计原因、
++运行时行为、兼容边界和已知限制。
++
++本文比较的版本为：
++
++- 社区基线：`main`，提交 `4f20009`
++- 优化版本：`opt2`，提交 `d08daf5`
++
++相关的完整设计和磁盘格式说明参见
++[稀疏可控暂存设计与实现](sparse_controlled_staging.md)。
++
++## 1. 变更规模
++
++相对社区版，当前 `opt2` 的总体差异为：
++
++- 包含文档：新增 3086 行，删除 65 行，净新增 3021 行；
++- 排除文档：新增 2757 行，删除 65 行，净新增 2692 行；
++- 生产代码：新增 2172 行，删除 65 行，净新增 2107 行；
++- 测试代码：新增 585 行。
++
++生产代码按模块拆分：
++
++- `pkg/vfs`：净新增 1181 行；
++- `pkg/chunk`：净新增 459 行；
++- `pkg/meta`：净新增 272 行；
++- `cmd`：净新增 195 行。
++
++生产代码中不包含测试桩、mock 或断言逻辑。测试均位于 `*_test.go`。
++
++## 2. 要解决的社区版问题
++
++社区版把每次写入结果表示为不可变 slice。随机 4 KiB 覆盖写会不断产生新的
++slice，并更新中心元数据。当 slice 较多时，后台 compact 会把多个 slice 合并为
++新的连续对象。
++
++社区版 compact 对内部洞的处理是写入真实零数据。它只裁掉合并范围首尾的洞，
++第一个有效页和最后一个有效页之间的洞会通过 `WriteAt(make([]byte, len))`
++物化。因此，在 512 MiB 地址范围内分散写入 100 MiB 后，最终有效对象可能接近
++512 MiB。
++
++本优化针对以下场景：
++
++1. 一个文件在一次发布周期中只有一个写者；
++2. `fsync` 保证本地 staging 持久化并登记中心元数据；
++3. 对象上传由 `flush-staging`、API 或 staging 高水位触发；
++4. Put 完成前，其他客户端不会读取该文件；
++5. 同一个 64 MiB chunk 内的重复随机写应复用同一个 slice；
++6. 未写入区域在本地和对象存储中始终保持为洞。
++
++## 3. 总体架构变化
++
++社区版写路径是：
++
++1. 创建不可变 slice；
++2. 写入普通 block；
++3. 将 slice 追加到中心元数据；
++4. writeback 模式下再异步上传 block；
++5. slice 过多时执行 dense compact。
++
++优化后的 sparse 写路径是：
++
++1. 为 `(inode, chunk index)` 创建一个本地 sparse generation；
++2. 对齐的 4 KiB 写直接覆盖 `.stage` 文件对应位置；
++3. 用 bitmap 记录 data、zero 和 inherit 三种页面状态；
++4. `fsync` checkpoint 本地文件，然后幂等登记同一个全局 sparse slice；
++5. `flush-staging` 只打包 data 页面并上传 manifest；
++6. 发布完成后删除本地 generation；
++7. 后续写入创建新的 generation，已发布对象保持不可变。
++
++未启用 `--sparse-chunk-slice` 时，普通 JuiceFS 写入和 writeback 路径保持社区版
++行为。早期实现过的 dense `PatchStaging` 方案已经全部删除。
++
++## 4. 配置和格式版本
++
++### 4.1 新增 sparse 格式版本
++
++修改文件：
++
++- `pkg/meta/interface.go`
++- `cmd/format.go`
++- `cmd/config.go`
++- `cmd/mount.go`
++
++社区版最大元数据格式版本是 1。优化版保留新卷默认版本 1，同时把客户端可识别的
++最大版本提升到 2：
++
++- `DefaultFormatVersion = 1`
++- `MaxVersion = 2`
++- `SparseFormatVersion = 2`
++
++启用前必须执行：
++
++```shell
++juicefs config META-URL --enable-sparse-chunk
++```
++
++该命令把卷的 `MetaVersion` 从 1 升级到 2。升级不可回退。社区版客户端只支持
++版本 1，因此会拒绝挂载版本 2，而不是把 sparse slice 当成普通 slice 错误读取。
++
++### 4.2 新增挂载参数
++
++修改文件：
++
++- `cmd/flags.go`
++- `cmd/mount.go`
++- `pkg/chunk/cached_store.go`
++
++新增参数：
++
++- `--sparse-chunk-slice`：启用 sparse generation；
++- `--stage-usage-high-ratio`：staging 数据达到配置 cache 容量的指定比例时发布；
++  设置为 `0` 时关闭水位触发。
++
++挂载要求：
++
++```shell
++juicefs mount META-URL MOUNTPOINT \
++  --writeback \
++  --sparse-chunk-slice \
++  --stage-usage-high-ratio 0 \
++  --cache-dir /path/to/cache
++```
++
++该模式要求：
++
++- 已升级到元数据格式 2；
++- 启用 writeback；
++- 使用磁盘 cache，不能使用纯内存 cache。
++
++原先独立的 `--controlled-staging`、low watermark 和 staging buffer 参数已经
++删除。sparse staging 不再依赖早期的 dense staging 覆盖方案。
++
++## 5. Sparse slice 标识
++
++修改文件：
++
++- `pkg/meta/interface.go`
++- `pkg/chunk/sparse.go`
++- `pkg/vfs/sparse_staging.go`
++
++使用 slice ID 的 bit 62 标识 packed sparse slice：
++
++```text
++SparseSliceBit = 1 << 62
++```
++
++选择 bit 62 的原因：
++
++- 保持 `int64` 正数，不占用符号位；
++- 去掉标志位后仍是正常的全局 slice ID；
++- 不修改已有 24 字节 slice 元数据记录格式；
++- 删除、读取和 compact 路径可以快速识别对象格式。
++
++`NewSlice` 仍由中心元数据分配普通 ID，本地创建 generation 时再设置 sparse bit。
++
++## 6. 本地 sparse staging
++
++主要新增文件：
++
++- `pkg/vfs/sparse_staging.go`
++
++这是本次优化最大的代码模块，共新增约 792 行。
++
++### 6.1 Generation 索引
++
++每个 generation 用以下键定位：
++
++```text
++(inode, 64 MiB chunk index)
++```
++
++内存中维护：
++
++- `active`：当前可覆盖写的 generation；
++- `pending`：已经冻结、等待或正在发布的 generation；
++- `byID`：按 sparse slice ID 查找 generation；
++- `localIDs`：读路径快速判断某个全局 slice 是否仍由本地 staging 提供。
++
++同一发布周期内，对一个 chunk 的所有随机写都复用 `active`，不会为每次 4 KiB
++覆盖重新创建 slice。
++
++### 6.2 `.stage` 文件布局
++
++每个 generation 对应一个文件：
++
++```text
++sparse-staging/<inode>-<chunk>-<slice-id>.stage
++```
++
++逻辑布局：
++
++```text
++0        8 KiB       16 KiB                         64 MiB + 16 KiB
++| slot0 | slot1 | sparse data area                       |
++```
++
++数据区逻辑长度为 64 MiB，但通过按偏移写入保持文件系统稀疏。未写页不会分配磁盘
++block。
++
++### 6.3 双 header checkpoint
++
++每个 8 KiB header slot 保存：
++
++- magic 和格式版本；
++- sequence；
++- inode、chunk index 和 sparse slice ID；
++-真实 EOF 和 mtime；
++- data bitmap 和 zero bitmap；
++- active/frozen 状态；
++- CRC32。
++
++`fsync` 时执行：
++
++1. `fsync` `.stage` 文件，先持久化数据页；
++2. 把新 header 写到另一个 slot；
++3. 再次 `fsync` 文件；
++4. `fsync` staging 目录。
++
++恢复时读取两个 slot，选择 CRC 正确且 sequence 最大的版本。该实现没有逐写
++journal；双 slot 是避免 header 覆盖写过程中掉电损坏上一次 checkpoint 的最小
++机制。
++
++## 7. 页面状态和随机写
++
++修改文件：
++
++- `pkg/vfs/sparse_staging.go`
++- `pkg/vfs/writer.go`
++
++一个 chunk 包含 16384 个 4 KiB 页面。每个 generation 保存两张 2048 字节的
++bitmap：
++
++- data bitmap：页面内容保存在 staging 文件；
++- zero bitmap：页面逻辑内容是零，但不保存 4 KiB 零数据；
++- 两张 bitmap 都未置位：inherit，继承更老 generation 或已发布 slice。
++
++### 7.1 完整页面覆盖
++
++当写入正好覆盖完整且对齐的 4 KiB 页面时，直接 `WriteAt`，不读取旧数据。
++
++非零页面写入 staging 数据区并设置 data bit。全零页面只设置 zero bit，因此不会
++占用数据区空间。
++
++### 7.2 非完整页面写入
++
++当一次写入没有覆盖完整 4 KiB 页面时，必须执行 read-modify-write：
++
++1. 当前 generation 已有 data 页时，从 `.stage` 读取；
++2. 当前页是 zero 时，以零页为基础；
++3. 当前页是 inherit 时，从旧 slice 和 pending generation 读取基础页；
++4. 修改目标字节后重新判断页面是 data 还是 zero。
++
++这是 POSIX 部分写语义所必需的，不能直接覆盖而丢失页面内未修改字节。
++
++### 7.3 Writer 分流
++
++`pkg/vfs/writer.go` 新增 `sparseFileWriter`。启用 sparse 后：
++
++- `Open` 返回 `sparseFileWriter`；
++- `Write` 直接进入 sparse staging；
++- `Flush`/`Fsync` 调用 `SyncInode`；
++- 普通 `fileWriter` 和社区版 slice writer 不参与 sparse 写入；
++- 普通模式仍走社区版 writer。
++
++sparse 模式不再启动只服务普通 `fileWriter` 的周期性 flush goroutine。
++
++## 8. fsync 与中心元数据登记
++
++修改文件：
++
++- `pkg/vfs/sparse_staging.go`
++- `pkg/meta/base.go`
++- `pkg/meta/context.go`
++- `pkg/meta/slice.go`
++- `pkg/meta/redis.go`
++- `pkg/meta/sql.go`
++- `pkg/meta/tkv.go`
++
++### 8.1 登记时机
++
++社区版每个新 slice 完成后立即追加元数据。优化版改为：
++
++1. 普通 `write` 只更新本地 staging；
++2. `fsync`/flush/close 先完成本地 checkpoint；
++3. checkpoint 成功后调用 `WriteEOF` 登记 sparse slice；
++4. 第一次登记追加一条记录；
++5. 后续 fsync 使用同一个 ID，幂等更新 EOF 和 mtime，不追加 slice。
++
++Put 不再修改 slice 元数据，只上传该 ID 对应的 payload 和 manifest。
++
++### 8.2 为什么单独传递 EOF
++
++中心元数据中的 sparse slice 使用：
++
++```text
++Pos  = 0
++Off  = 0
++Size = 64 MiB
++Len  = 64 MiB
++```
++
++这是为了覆盖整个 chunk 并表达 inherit/data/zero 页面。如果直接按 `Len` 更新文件
++长度，短文件会被错误扩展到 chunk 边界。
++
++因此新增：
++
++- `WriteEOF`
++- `WithFileLength`
++- `sliceCommitLength`
++
++真实 EOF 通过 context 独立传递，slice 记录本身仍保持社区版格式。
++
++### 8.3 三类元数据引擎幂等
++
++Redis、SQL 和 TKV 都增加相同语义：
++
++1. 在现有 chunk 记录中查找相同 slice ID；
++2. ID 不存在时正常追加；
++3. ID 已存在且记录完全一致时不再追加；
++4. ID 已存在但位置、大小或范围不一致时返回 `EINVAL`；
++5. 即使 slice 已存在，仍允许更新 EOF、mtime 和 changelog。
++
++SQL 路径还必须避免重复增加 `sliceRef`，否则每次 fsync 都会抬高引用计数，导致
++对象无法正确回收。
++
++Redis 事务把 chunk key 纳入 WATCH，防止检查与追加之间出现并发变化。
++
++## 9. Changelog、dump 和 backup 兼容
++
++修改文件：
++
++- `pkg/meta/changelog.go`
++- `pkg/meta/changelog_replay.go`
++- `pkg/meta/dump.go`
++- `pkg/meta/backup.go`
++
++### 9.1 Changelog
++
++WRITE changelog 从原来的 7 个参数扩展为可选的第 8 个 EOF 参数：
++
++- 旧记录仍按 7 参数解析；
++- 新 sparse 记录用第 8 参数恢复真实文件长度；
++- replay 检测到 EOF 后调用 `WriteEOF`。
++
++### 9.2 nextChunk 计数器
++
++sparse ID 含 bit 62。dump 和 backup 计算下一个 slice ID 时必须先清除该格式位：
++
++```text
++counterID = sparseID &^ SparseSliceBit
++```
++
++否则恢复后会把 nextChunk 推进到接近 `1 << 62`，破坏正常 ID 分配。
++
++## 10. 元数据读取和 overlay
++
++修改文件：
++
++- `pkg/meta/base.go`
++- `pkg/meta/openfile.go`
++- `pkg/meta/interface.go`
++- `pkg/vfs/reader.go`
++
++社区版 `buildSlice` 会根据覆盖关系消除旧 slice。该行为不适用于 sparse：
++新 generation 中的 inherit 页面必须继续读取更老的数据。
++
++因此新增：
++
++- `OverlaySlice`：保留 slice 在 chunk 中的真实位置；
++- `OverlayReader`：返回持久化写入顺序；
++- `HybridReader`：普通 chunk 继续返回社区版视图，包含 sparse 时返回 overlay；
++- open-file overlay cache：缓存 raw overlay 结果。
++
++读取顺序是：
++
++1. 读取更老的 dense 或 sparse slice；
++2. 按写入顺序应用后续 sparse generation；
++3. inherit 不修改结果；
++4. zero 清零；
++5. data 用 packed payload 或本地 `.stage` 覆盖。
++
++本地未发布 generation 的 slice ID 已经存在于中心元数据，但对象 manifest 尚未
++存在。读路径通过 `localIDs` 跳过对象读取，再叠加本地 staging，从而保证同节点
++read-your-writes。
++
++## 11. Sparse 对象格式
++
++主要新增文件：
++
++- `pkg/chunk/sparse.go`
++
++该文件新增约 431 行。
++
++### 11.1 Manifest
++
++manifest 保存：
++
++- magic、版本和 CRC32；
++- page size：4 KiB；
++- logical chunk size：64 MiB；
++- payload part size：4 MiB；
++- data bitmap；
++- zero bitmap；
++- payload part 数量和每个 part 的实际大小。
++
++manifest 在所有 payload part 上传成功后最后上传。读者只有在 manifest 可见后才
++能确定该 generation 已完整发布。
++
++### 11.2 Packed payload
++
++Put 时按页号顺序遍历 data bitmap，只上传 data 页面：
++
++- inherit 页面不上传；
++- zero 页面不上传；
++- data 页面紧密排列；
++- 每个 payload part 最大 4 MiB。
++
++因此对象存储占用接近真实 data 页总量，而不是 slice 的 64 MiB 逻辑长度。
++
++### 11.3 Prefix rank
++
++packed payload 中没有保留页面洞。读取逻辑页时需要计算该页之前有多少 data 页。
++
++manifest 加载后构建按 bitmap 字节的 prefix rank。读取单页时可以快速把逻辑页号
++转换为 packed payload 偏移，避免从 bitmap 起点重复扫描。
++
++`ReadSparsePages` 会把同一 payload part 中的页面合并为一次 range GET，避免
++4 KiB 随机读为每页发起一个对象请求。
++
++### 11.4 删除
++
++`cachedStore.Remove` 检测 sparse bit 后调用 `RemoveSparse`：
++
++1. 先通过回调删除可能尚未上传的本地 `.stage`；
++2. 再按 sparse ID 前缀列举并删除 manifest、payload 和部分上传对象；
++3. 清理 manifest 内存缓存。
++
++该顺序避免 inode 已删除后，本地 staging 在重启时重新登记元数据。
++
++## 12. Compact 行为变化
++
++修改文件：
++
++- `pkg/meta/base.go`
++
++社区版 dense compact 不理解 inherit 页面。如果直接 compact sparse slice，会把
++内部洞写成零，既破坏继承语义，也重新引入空间放大。
++
++当前行为是：chunk 中只要存在 sparse slice，就跳过社区版 compact。
++
++影响：
++
++- 单次发布周期保持每 chunk 一个 slice；
++- 多次 Put 后可能积累多个不可变 sparse generation；
++- 当前尚未实现 sparse-aware compact；
++- 上层应控制 Put 频率，避免长期产生过多 generation。
++
++## 13. 显式 Put
++
++新增文件：
++
++- `cmd/flush_staging.go`
++- `pkg/vfs/flush_staging.go`
++- `pkg/vfs/internal.go`
++
++新增命令：
++
++```shell
++juicefs flush-staging MOUNTPOINT/path
++juicefs flush-staging --wait MOUNTPOINT/path
++juicefs flush-staging --wait MOUNTPOINT
++```
++
++命令通过 JuiceFS 控制文件向挂载进程发送 `FlushStaging` 消息。
++
++支持：
++
++- 单文件；
++- 目录递归；
++- 整个挂载点；
++- 默认异步发布；
++- `--wait` 等待上传完成。
++
++当前命令只发布 sparse generation，不再包含早期 dense writeback staging 的扫描、
++定向 block 上传和等待队列。
++
++发布流程：
++
++1. checkpoint 并登记目标 inode 的 active generation；
++2. 把 active 标记 frozen 并移入 pending；
++3. 上传 packed payload；
++4. 最后上传 manifest；
++5. 使本地读缓存失效；
++6. 删除 pending 和 `.stage`。
++
++上传失败时 pending 和本地文件保留，可以使用相同 ID 重试。
++
++## 14. 发布期间并发写
++
++修改文件：
++
++- `pkg/vfs/sparse_staging.go`
++
++发布开始后，generation 必须保持不可变，否则正在上传的 payload 和 bitmap 可能
++不一致。
++
++因此 Put 会冻结 active。发布期间如果继续写同一 chunk，会创建新的 active
++generation。旧 generation 保持在 pending，直到上传成功。
++
++这意味着：
++
++- 不发生 Put/写重叠时，每 chunk 通常只有一个 generation；
++- Put 与写重叠时会临时产生多个 generation；
++- `publishMu` 串行化多个 Put；
++- 读锁阻止发布清理正在被本地读使用的 stage 文件。
++
++如果应用能够额外保证 Put 期间完全不写，可以在未来进一步简化 pending 状态机；
++当前实现没有依赖该更强假设。
++
++## 15. 重启恢复
++
++修改文件：
++
++- `pkg/vfs/sparse_staging.go`
++
++挂载时扫描 `sparse-staging/*.stage`：
++
++1. 检查文件逻辑长度；
++2. 读取两个 header slot；
++3. 选择 sequence 最大的有效 checkpoint；
++4. 恢复 data/zero bitmap、EOF、mtime 和 frozen 状态；
++5. 重建 active、pending、byID 和 localIDs；
++6. 使用相同 sparse ID 幂等调用 `WriteEOF`；
++7. inode 已删除时清理该 stage；
++8. 没有有效 header 的文件视为从未成功 fsync，直接删除。
++
++恢复不会自动 Put。只要使用同一个 cache 目录，本地 fsync 后的数据可以继续读取或
++由用户显式发布。
++
++恢复不解决 staging 磁盘损坏或丢失。中心元数据已经登记但对象尚未 Put 时，如果
++本地 staging 盘同时丢失，该部分数据无法恢复。
++
++## 16. 删除、硬链接和 rename
++
++修改文件：
++
++- `pkg/chunk/cached_store.go`
++- `pkg/chunk/sparse.go`
++- `pkg/vfs/sparse_staging.go`
++
++删除沿用社区版 slice 生命周期：
++
++- inode 仍有硬链接时不删除 slice；
++- open-unlink 时遵循 sustained inode，最后一个句柄关闭后再清理；
++- rename 覆盖导致旧 inode 最终删除时，进入同一 DeleteSlice 链路；
++- 未上传 generation 删除本地 `.stage`；
++- 已上传或部分上传 generation 删除对象前缀。
++
++删除和 Put 使用同一个 `publishMu`，避免发布线程读取文件时另一个线程删除 stage。
++
++## 17. 高水位发布
++
++修改文件：
++
++- `cmd/flags.go`
++- `pkg/chunk/cached_store.go`
++- `pkg/vfs/sparse_staging.go`
++
++每次 sparse 写结束后统计所有 active/pending generation 的 data 页面数量：
++
++```text
++staged bytes = data page count * 4096
++```
++
++当该值达到：
++
++```text
++cache-size * stage-usage-high-ratio
++```
++
++后台异步执行 `PublishAll`。
++
++设置 `--stage-usage-high-ratio=0` 会完全关闭该机制。关闭后，普通写、idle timer 和
++`upload-delay` 都不会自动发布 sparse generation。
++
++## 18. 暂不支持的操作
++
++修改文件：
++
++- `pkg/vfs/vfs.go`
++
++sparse 模式下明确返回 `ENOTSUP`：
++
++- truncate；
++- fallocate；
++- copy_file_range。
++
++这些操作会改变页面继承关系、EOF 或跨 inode slice 引用。在没有完整 sparse 语义
++前显式拒绝，比静默产生错误数据安全。
++
++metadata clone 在 Put 前也不安全：clone 可以共享中心 slice ID，但新 inode 不会
++自动共享原 inode 的本地 staging overlay。
++
++## 19. 对社区版原有行为的影响
++
++未启用 sparse 时：
++
++- 默认元数据格式仍是版本 1；
++- 普通 writer、writeback、upload-delay 和 dense compact 保持社区版行为；
++- 不会创建 `.stage` sparse 文件；
++- 不会使用 sparse bit；
++- 不会改变现有对象 key；
++- 社区版 dump、load 和 changelog 仍可使用原格式。
++
++启用 sparse 后：
++
++- 卷升级为格式 2；
++- 每 chunk 使用本地 sparse generation；
++- fsync 后元数据可见，但 Put 前远端对象不可见；
++- Put 前其他节点读取会因 manifest 不存在而失败；
++- dense compact 被禁用；
++- 对象使用 packed sparse 格式。
++
++## 20. 测试变更
++
++新增测试文件：
++
++- `pkg/meta/sparse_test.go`
++- `pkg/vfs/sparse_staging_test.go`
++
++扩展测试：
++
++- `pkg/chunk/cached_store_test.go`
++
++覆盖内容包括：
++
++- 三类元数据引擎 sparse ID 和 EOF；
++- 重复 fsync 不增加 slice；
++- 相同 ID 不同记录返回错误；
++- dump/backup 计数器清除 sparse bit；
++- 完整页覆盖、部分页 RMW、zero 和 inherit；
++- 双 header 重启恢复；
++- Put 前本机读取；
++- Put 后对象读取；
++- manifest CRC 和损坏检测；
++- 删除未上传 staging；
++- open-unlink；
++- hardlink 和 rename 覆盖；
++- Put/读并发保护；
++- 高水位发布；
++- 部分上传对象清理。
++
++## 21. 实测结果
++
++测试参数：
++
++- 512 MiB 地址范围；
++- 随机读写 100 MiB；
++- 4 KiB；
++- `direct=0`；
++- `psync`；
++- 单线程，`iodepth=1`；
++- 固定非零数据；
++- 读前卸载重挂并清理页缓存；
++- 没有使用顺序 `dd` 预热。
++
++精简后的优化版三轮中位数：
++
++- 随机写：25473 IOPS，99.5 MiB/s，p99 64.3 微秒；
++- 随机读：4316 IOPS，16.9 MiB/s，p99 610 微秒；
++- slice：8 个，对应 512 MiB 范围内的 8 个 chunk；
++- staging 实际占用约 100.50 MiB；
++- Put 后对象实际占用约 100.07 MiB。
++
++上午同口径单轮基线：
++
++- XFS：写 324051 IOPS，读 4754 IOPS；
++- 社区版：写 126 IOPS，读 3388 IOPS；
++- 优化版相对社区版：写约 203 倍，读约提升 27%。
++
++XFS 写入结果主要反映 buffered page cache。使用 `fallocate=none` 后，随机写
++100 MiB 的 XFS 文件实际占用约 100.70 MiB；fio 默认预分配时会占用完整 512 MiB。
++
++社区版测试结束后，当前元数据最终 compact 为 8 个 slice，仍被引用的有效对象约
++511.92 MiB。测试过程中还产生大量历史对象和本地 cache；这些可被 GC 或 cache
++淘汰，但最终有效对象仍接近 512 MiB，因为 dense compact 物化了内部洞。
++
++## 22. 已知风险和后续工作
++
++### 22.1 应用时序约束
++
++中心元数据在 fsync 后已经包含 sparse ID，而 manifest 只在 Put 时上传。应用必须
++保证 Put 完成前其他客户端不读取。
++
++### 22.2 Staging 单点
++
++未 Put 数据只存在本地 staging。节点和 staging 盘同时丢失会导致数据不可恢复。
++
++### 22.3 多写者
++
++当前没有分布式租约或冲突检测。多个客户端同时写同一文件可能产生最后写入者覆盖。
++
++### 22.4 多次 Put
++
++每次 Put 后再次写入会创建新 generation。当前没有 sparse-aware compact，长期
++频繁 Put 会增加 sparse slice 数量。
++
++### 22.5 GC 和统计
++
++`juicefs gc` 尚未完整理解 sparse manifest/payload 引用，空间统计也不完整。
++删除单个 sparse slice 已有专用前缀清理逻辑，但全局 GC 仍需扩展。
++
++### 22.6 对象存储能力
++
++sparse payload 当前直接调用对象存储：
++
++- 尚未接入社区版 block compression；
++- 尚未接入上传限速；
++- 尚未接入 tier 选择；
++- manifest cache 目前没有容量上限。
++
++### 22.7 功能范围
++
++truncate、fallocate、copy_file_range 和 Put 前 clone 尚未支持。该功能应保持
++实验性，只用于本文约束明确的工作负载。
++
++## 23. 完整文件变更清单
++
++### CLI 和配置
++
++- `cmd/config.go`：增加不可逆 sparse 格式升级；
++- `cmd/flags.go`：增加 sparse 和高水位参数；
++- `cmd/flush_staging.go`：增加显式发布命令；
++- `cmd/format.go`：新卷继续使用格式版本 1；
++- `cmd/main.go`：注册 `flush-staging`；
++- `cmd/mount.go`：构建 sparse 配置并检查格式版本。
++
++### Chunk 和对象存储
++
++- `pkg/chunk/sparse.go`：manifest、payload、packed read、删除；
++- `pkg/chunk/cached_store.go`：sparse 配置、manifest cache、Remove 分流；
++- `pkg/chunk/cached_store_test.go`：sparse 对象格式测试。
++
++### 元数据
++
++- `pkg/meta/interface.go`：格式版本、sparse bit、overlay 接口；
++- `pkg/meta/context.go`：真实 EOF context；
++- `pkg/meta/slice.go`：幂等记录比较、EOF 长度和 changelog 参数；
++- `pkg/meta/base.go`：WriteEOF、overlay/hybrid read、跳过 dense compact；
++- `pkg/meta/openfile.go`：overlay 缓存；
++- `pkg/meta/redis.go`：Redis 幂等登记；
++- `pkg/meta/sql.go`：SQL 幂等登记和引用计数保护；
++- `pkg/meta/tkv.go`：TKV 幂等登记；
++- `pkg/meta/changelog.go`：兼容 7/8 参数 WRITE；
++- `pkg/meta/changelog_replay.go`：恢复真实 EOF；
++- `pkg/meta/dump.go`：nextChunk 清除 sparse bit；
++- `pkg/meta/backup.go`：backup nextChunk 清除 sparse bit；
++- `pkg/meta/sparse_test.go`：三引擎和备份兼容测试。
++
++### VFS
++
++- `pkg/vfs/sparse_staging.go`：本地 generation、checkpoint、恢复和发布；
++- `pkg/vfs/writer.go`：sparse writer 分流；
++- `pkg/vfs/reader.go`：全局和本地 sparse overlay 读取；
++- `pkg/vfs/flush_staging.go`：按路径发布 sparse generation；
++- `pkg/vfs/internal.go`：控制消息处理；
++- `pkg/vfs/vfs.go`：拒绝尚未支持的操作；
++- `pkg/vfs/sparse_staging_test.go`：VFS 生命周期和故障语义测试。
++
++### 文档
++
++- `docs/en/guide/cache.md`：英文启用说明和限制；
++- `docs/zh_cn/guide/cache.md`：中文启用说明和限制；
++- `docs/zh_cn/development/sparse_controlled_staging.md`：完整设计文档；
++- `docs/zh_cn/development/sparse_staging_community_diff.md`：本文。
+diff --git a/docs/zh_cn/guide/cache.md b/docs/zh_cn/guide/cache.md
+index 5d64148abad26675a6c742acd68ae72b1e264a21..2d97bfd093015f38e844511eb75c7189da401c58 100644
+--- a/docs/zh_cn/guide/cache.md
++++ b/docs/zh_cn/guide/cache.md
+@@ -202,6 +202,12 @@ JuiceFS 客户端会把从对象存储下载的数据，以及新上传的小于
+ * 软件编译
+ * 大数据任务的临时存储场景，比如 Spark shuffle
+ 
++#### 实验性稀疏可控暂存
++
++`--sparse-chunk-slice` 是 `--writeback` 的实验性扩展。随机写会覆盖每个文件 Chunk 对应的一个本地稀疏 64 MiB generation；首次 `fsync`、`flush` 或 close 会在本地 checkpoint 后登记一条稳定的中心 slice，后续同步幂等复用该记录，不会不断增加 slice。使用 `juicefs flush-staging` 只上传 packed payload 和 manifest；暂存空间达到高水位时也可以触发保护性发布。
++
++首次启用前必须执行 `juicefs config META-URL --enable-sparse-chunk`，将元数据格式不可逆地升级到版本 2，使不支持 packed sparse 格式的客户端拒绝挂载。Put 完成前 manifest 尚不存在，其他客户端不能读取已经登记的 sparse slice；该模式只适用于应用能够保证单写者并控制跨节点读取时序的场景。该模式目前不支持 truncate、fallocate 和 copy-file-range，也尚未实现 sparse compact、完整 GC、压缩、上传限速和 tier 集成。设计、文件格式、故障语义及其他限制请参见[稀疏可控暂存设计与实现](../development/sparse_controlled_staging.md)。
++
+ 启用 `--writeback` 模式后，除了直接查看 `/var/jfsCache/<UUID>/rawstaging/` 目录，还可以通过以下命令确定文件上传进度：
+ 
+ ```shell
+diff --git a/pkg/chunk/cached_store.go b/pkg/chunk/cached_store.go
+index 27ff6fec31c4035ccb185a701f609509ee1bfae1..da54d102c4245c5dcf68c861d9d634b998e3f29d 100644
+--- a/pkg/chunk/cached_store.go
++++ b/pkg/chunk/cached_store.go
+@@ -554,6 +554,12 @@ type Config struct {
+ 	BufferSize             uint64
+ 	Readahead              int
+ 	Prefetch               int
++
++	// StageUsageHigh is the sparse staging usage / configured cache capacity
++	// ratio that triggers background publication. 0 disables the watermark.
++	StageUsageHigh float32
++	// SparseChunkSlice keeps one sparse 64 MiB local generation per inode/chunk.
++	SparseChunkSlice bool
+ }
+ 
+ func (c *Config) SelfCheck(uuid string) {
+@@ -604,12 +610,27 @@ func (c *Config) SelfCheck(uuid string) {
+ 		if c.WritebackThresholdSize == 0 {
+ 			c.WritebackThresholdSize = c.BlockSize + 1
+ 		}
++		if c.SparseChunkSlice {
++			if c.StageUsageHigh < 0 {
++				c.StageUsageHigh = 0
++			} else if c.StageUsageHigh > 1 {
++				logger.Warnf("stage-usage-high-ratio should be in [0,1], got %v, set to 1", c.StageUsageHigh)
++				c.StageUsageHigh = 1
++			}
++		} else {
++			c.StageUsageHigh = 0
++		}
+ 	} else {
+ 		if c.UploadDelay > 0 || c.UploadHours != "" {
+ 			logger.Warnf("delayed upload is disabled in non-writeback mode")
+ 			c.UploadDelay = 0
+ 			c.UploadHours = ""
+ 		}
++		c.StageUsageHigh = 0
++		if c.SparseChunkSlice {
++			logger.Warnf("sparse-chunk-slice requires writeback; disabling it")
++			c.SparseChunkSlice = false
++		}
+ 	}
+ 	if _, _, err := c.parseHours(); err != nil {
+ 		logger.Warnf("invalid value (%s) for upload-hours: %s", c.UploadHours, err)
+@@ -678,6 +699,11 @@ type cachedStore struct {
+ 	upLimit         *ratelimit.Bucket
+ 	downLimit       *ratelimit.Bucket
+ 
++	sparseManifestMu   sync.Mutex
++	sparseManifests    map[uint64]*sparseManifest
++	sparseStageMu      sync.Mutex
++	sparseStageRemover func(uint64) error
++
+ 	cacheHits           prometheus.Counter
+ 	cacheMiss           prometheus.Counter
+ 	cacheHitBytes       prometheus.Counter
+@@ -854,6 +880,7 @@ func NewCachedStore(storage object.ObjectStorage, config Config, reg prometheus.
+ 		seekable:        compressor.CompressBound(0) == 0,
+ 		pendingCh:       make(chan *pendingItem, 100*config.MaxUpload),
+ 		pendingKeys:     make(map[string]*pendingItem),
++		sparseManifests: make(map[uint64]*sparseManifest),
+ 		group:           NewController(),
+ 	}
+ 	if config.UploadLimit > 0 {
+@@ -1183,6 +1210,9 @@ func (store *cachedStore) NewWriter(id uint64, tierID uint8) Writer {
+ }
+ 
+ func (store *cachedStore) Remove(id uint64, length int) error {
++	if IsSparseSliceID(id) {
++		return store.RemoveSparse(id)
++	}
+ 	r := sliceForRead(id, length, store)
+ 	return r.Remove()
+ }
+diff --git a/pkg/chunk/cached_store_test.go b/pkg/chunk/cached_store_test.go
+index 74517edbab708e1c9d75503a4fc7db6b358f14a6..e0caaa905a5661d017eba28e7ca6b8a063c3aef9 100644
+--- a/pkg/chunk/cached_store_test.go
++++ b/pkg/chunk/cached_store_test.go
+@@ -305,6 +305,80 @@ func TestStoreAsync(t *testing.T) {
+ 	}
+ }
+ 
++func TestSparseManifestReadAndCorruption(t *testing.T) {
++	mem, _ := object.CreateStorage("mem", "", "", "", "")
++	conf := defaultConf
++	conf.CacheDir = t.TempDir()
++	store := NewCachedStore(mem, conf, nil).(*cachedStore)
++
++	id := SparseSliceBit | 501
++	dataBitmap := make([]byte, SparseBitmapSize)
++	zeroBitmap := make([]byte, SparseBitmapSize)
++	dataBitmap[0] = 1 << 2
++	zeroBitmap[0] = 1 << 4
++	_, err := store.UploadSparse(context.Background(), id, 5*SparsePageSize,
++		dataBitmap, zeroBitmap, func(page int, data []byte) error {
++			require.Equal(t, 2, page)
++			copy(data, bytes.Repeat([]byte{7}, len(data)))
++			return nil
++		})
++	require.NoError(t, err)
++
++	page := make([]byte, SparsePageSize)
++	state, err := store.ReadSparsePage(context.Background(), id, 1, page)
++	require.NoError(t, err)
++	require.Equal(t, SparsePageInherit, state)
++	state, err = store.ReadSparsePage(context.Background(), id, 2, page)
++	require.NoError(t, err)
++	require.Equal(t, SparsePageData, state)
++	require.Equal(t, bytes.Repeat([]byte{7}, len(page)), page)
++	state, err = store.ReadSparsePage(context.Background(), id, 4, page)
++	require.NoError(t, err)
++	require.Equal(t, SparsePageZero, state)
++	require.Equal(t, make([]byte, len(page)), page)
++
++	states := make([]SparsePageState, 4)
++	pages := bytes.Repeat([]byte{9}, len(states)*SparsePageSize)
++	require.NoError(t, store.ReadSparsePages(context.Background(), id, 1, states, pages))
++	require.Equal(t, []SparsePageState{SparsePageInherit, SparsePageData, SparsePageInherit, SparsePageZero}, states)
++	require.Equal(t, bytes.Repeat([]byte{7}, SparsePageSize), pages[SparsePageSize:2*SparsePageSize])
++	require.Equal(t, make([]byte, SparsePageSize), pages[3*SparsePageSize:])
++
++	require.NoError(t, store.RemoveSparse(id))
++	_, err = mem.Head(context.Background(), store.sparseManifestKey(id))
++	require.Error(t, err)
++
++	partialID := SparseSliceBit | 502
++	partialKey := store.sparsePrefix(partialID) + "_partial"
++	require.NoError(t, mem.Put(context.Background(), partialKey, bytes.NewReader([]byte("partial"))))
++	var removedID uint64
++	store.SetSparseStageRemover(func(id uint64) error {
++		removedID = id
++		return nil
++	})
++	require.NoError(t, store.RemoveSparse(partialID))
++	require.Equal(t, partialID, removedID)
++	_, err = mem.Head(context.Background(), partialKey)
++	require.Error(t, err)
++
++	failedID := SparseSliceBit | 503
++	failedKey := store.sparsePrefix(failedID) + "_partial"
++	require.NoError(t, mem.Put(context.Background(), failedKey, bytes.NewReader([]byte("partial"))))
++	store.SetSparseStageRemover(func(uint64) error { return errors.New("stage busy") })
++	require.EqualError(t, store.RemoveSparse(failedID), "stage busy")
++	_, err = mem.Head(context.Background(), failedKey)
++	require.NoError(t, err)
++	store.SetSparseStageRemover(nil)
++
++	missingID := SparseSliceBit | 504
++	_, err = store.ReadSparsePage(context.Background(), missingID, 0, page)
++	require.Error(t, err)
++	corruptID := SparseSliceBit | 505
++	require.NoError(t, mem.Put(context.Background(), store.sparseManifestKey(corruptID), bytes.NewReader([]byte("bad"))))
++	_, err = store.ReadSparsePage(context.Background(), corruptID, 0, page)
++	require.Error(t, err)
++}
++
+ func TestForceUpload(t *testing.T) {
+ 	blob, _ := object.CreateStorage("mem", "", "", "", "")
+ 	config := defaultConf
+diff --git a/pkg/chunk/sparse.go b/pkg/chunk/sparse.go
+new file mode 100644
+index 0000000000000000000000000000000000000000..ece325e785e8f88ee1ff5fdfb45f13502c0f1747
+--- /dev/null
++++ b/pkg/chunk/sparse.go
+@@ -0,0 +1,431 @@
++/*
++ * JuiceFS, Copyright 2026 Juicedata, Inc.
++ *
++ * Licensed under the Apache License, Version 2.0 (the "License");
++ * you may not use this file except in compliance with the License.
++ * You may obtain a copy of the License at
++ *
++ *     http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++package chunk
++
++import (
++	"bytes"
++	"context"
++	"encoding/binary"
++	"errors"
++	"fmt"
++	"hash/crc32"
++	"io"
++	"math/bits"
++
++	"github.com/juicedata/juicefs/pkg/object"
++)
++
++const (
++	SparseSliceBit        uint64 = 1 << 62
++	SparsePageSize               = 4 << 10
++	SparseBitmapSize             = chunkSize / SparsePageSize / 8
++	sparsePayloadSize            = 4 << 20
++	sparseManifestVersion        = 1
++)
++
++var sparseManifestMagic = [8]byte{'J', 'F', 'S', 'S', 'P', 'R', '0', '1'}
++
++type SparsePageState uint8
++
++const (
++	SparsePageInherit SparsePageState = iota
++	SparsePageData
++	SparsePageZero
++)
++
++// SparseChunkStore is implemented by cachedStore without expanding the legacy
++// ChunkStore interface used by external tests and SDK adapters.
++type SparseChunkStore interface {
++	UploadSparse(ctx context.Context, id uint64, logicalSize uint32, dataBitmap, zeroBitmap []byte,
++		readPage func(page int, data []byte) error) (int64, error)
++	ReadSparsePage(ctx context.Context, id uint64, page int, data []byte) (SparsePageState, error)
++	ReadSparsePages(ctx context.Context, id uint64, firstPage int, states []SparsePageState, data []byte) error
++	RemoveSparse(id uint64) error
++	SetSparseStageRemover(remover func(uint64) error)
++}
++
++type sparseManifest struct {
++	LogicalSize uint32
++	Data        [SparseBitmapSize]byte
++	Zero        [SparseBitmapSize]byte
++	PartSizes   []uint32
++	DataRanks   [SparseBitmapSize + 1]uint16
++}
++
++func IsSparseSliceID(id uint64) bool {
++	return id&SparseSliceBit != 0
++}
++
++func sparseBit(bitmap []byte, page int) bool {
++	return page >= 0 && page < chunkSize/SparsePageSize &&
++		bitmap[page>>3]&(1<<uint(page&7)) != 0
++}
++
++func (m *sparseManifest) buildRanks() {
++	var rank uint16
++	for i, b := range m.Data {
++		m.DataRanks[i] = rank
++		rank += uint16(bits.OnesCount8(b))
++	}
++	m.DataRanks[len(m.Data)] = rank
++}
++
++func (m *sparseManifest) dataRank(page int) int {
++	full := page >> 3
++	rank := int(m.DataRanks[full])
++	if rem := page & 7; rem != 0 {
++		rank += bits.OnesCount8(m.Data[full] & byte((1<<uint(rem))-1))
++	}
++	return rank
++}
++
++func sparseCount(bitmap []byte) int {
++	var n int
++	for _, b := range bitmap {
++		n += bits.OnesCount8(b)
++	}
++	return n
++}
++
++func (m *sparseManifest) marshal() []byte {
++	n := 8 + 2 + 2 + 4 + 4 + SparseBitmapSize*2 + 4 + len(m.PartSizes)*4 + 4
++	buf := make([]byte, n)
++	copy(buf, sparseManifestMagic[:])
++	binary.LittleEndian.PutUint16(buf[8:], sparseManifestVersion)
++	binary.LittleEndian.PutUint16(buf[10:], SparsePageSize)
++	binary.LittleEndian.PutUint32(buf[12:], m.LogicalSize)
++	binary.LittleEndian.PutUint32(buf[16:], sparsePayloadSize)
++	copy(buf[20:], m.Data[:])
++	copy(buf[20+SparseBitmapSize:], m.Zero[:])
++	p := 20 + SparseBitmapSize*2
++	binary.LittleEndian.PutUint32(buf[p:], uint32(len(m.PartSizes)))
++	p += 4
++	for _, size := range m.PartSizes {
++		binary.LittleEndian.PutUint32(buf[p:], size)
++		p += 4
++	}
++	binary.LittleEndian.PutUint32(buf[p:], crc32.ChecksumIEEE(buf[:p]))
++	return buf
++}
++
++func unmarshalSparseManifest(buf []byte) (*sparseManifest, error) {
++	const fixed = 8 + 2 + 2 + 4 + 4 + SparseBitmapSize*2 + 4 + 4
++	if len(buf) < fixed || !bytes.Equal(buf[:8], sparseManifestMagic[:]) {
++		return nil, errors.New("invalid sparse manifest magic or length")
++	}
++	if binary.LittleEndian.Uint16(buf[8:]) != sparseManifestVersion ||
++		binary.LittleEndian.Uint16(buf[10:]) != SparsePageSize ||
++		binary.LittleEndian.Uint32(buf[16:]) != sparsePayloadSize {
++		return nil, errors.New("unsupported sparse manifest format")
++	}
++	logical := binary.LittleEndian.Uint32(buf[12:])
++	if logical == 0 || logical > chunkSize {
++		return nil, fmt.Errorf("invalid sparse logical size %d", logical)
++	}
++	p := 20 + SparseBitmapSize*2
++	parts := int(binary.LittleEndian.Uint32(buf[p:]))
++	p += 4
++	if parts < 0 || len(buf) != p+parts*4+4 {
++		return nil, errors.New("invalid sparse manifest part table")
++	}
++	if crc32.ChecksumIEEE(buf[:len(buf)-4]) != binary.LittleEndian.Uint32(buf[len(buf)-4:]) {
++		return nil, errors.New("sparse manifest checksum mismatch")
++	}
++	m := &sparseManifest{LogicalSize: logical, PartSizes: make([]uint32, parts)}
++	copy(m.Data[:], buf[20:20+SparseBitmapSize])
++	copy(m.Zero[:], buf[20+SparseBitmapSize:20+SparseBitmapSize*2])
++	for i := range m.Data {
++		if m.Data[i]&m.Zero[i] != 0 {
++			return nil, errors.New("overlapping sparse data and zero bitmaps")
++		}
++	}
++	for i := range m.PartSizes {
++		m.PartSizes[i] = binary.LittleEndian.Uint32(buf[p:])
++		p += 4
++		if m.PartSizes[i] == 0 || m.PartSizes[i] > sparsePayloadSize ||
++			m.PartSizes[i]%SparsePageSize != 0 {
++			return nil, errors.New("invalid sparse payload part size")
++		}
++	}
++	expectedParts := (sparseCount(m.Data[:])*SparsePageSize + sparsePayloadSize - 1) / sparsePayloadSize
++	if expectedParts != len(m.PartSizes) {
++		return nil, errors.New("sparse manifest payload count mismatch")
++	}
++	m.buildRanks()
++	return m, nil
++}
++
++func (store *cachedStore) sparsePrefix(id uint64) string {
++	if store.conf.HashPrefix {
++		return fmt.Sprintf("chunks/%02X/%v/%v_sparse", id%256, id/1000/1000, id)
++	}
++	return fmt.Sprintf("chunks/%v/%v/%v_sparse", id/1000/1000, id/1000, id)
++}
++
++func (store *cachedStore) sparseManifestKey(id uint64) string {
++	return store.sparsePrefix(id) + ".manifest"
++}
++
++func (store *cachedStore) sparsePartKey(id uint64, part int, size uint32) string {
++	return fmt.Sprintf("%s_%d_%d", store.sparsePrefix(id), part, size)
++}
++
++func (store *cachedStore) UploadSparse(ctx context.Context, id uint64, logicalSize uint32,
++	dataBitmap, zeroBitmap []byte, readPage func(page int, data []byte) error) (int64, error) {
++	if !IsSparseSliceID(id) || len(dataBitmap) != SparseBitmapSize || len(zeroBitmap) != SparseBitmapSize {
++		return 0, errors.New("invalid sparse upload")
++	}
++	m := &sparseManifest{LogicalSize: logicalSize}
++	copy(m.Data[:], dataBitmap)
++	copy(m.Zero[:], zeroBitmap)
++	for i := range m.Data {
++		if m.Data[i]&m.Zero[i] != 0 {
++			return 0, errors.New("overlapping sparse data and zero bitmaps")
++		}
++	}
++	m.buildRanks()
++
++	part := make([]byte, 0, sparsePayloadSize)
++	page := make([]byte, SparsePageSize)
++	var uploaded int64
++	partIndex := 0
++	putPart := func() error {
++		if len(part) == 0 {
++			return nil
++		}
++		size := uint32(len(part))
++		if err := store.storage.Put(ctx, store.sparsePartKey(id, partIndex, size), bytes.NewReader(part)); err != nil {
++			return err
++		}
++		m.PartSizes = append(m.PartSizes, size)
++		uploaded += int64(size)
++		partIndex++
++		part = make([]byte, 0, sparsePayloadSize)
++		return nil
++	}
++	for i := 0; i < chunkSize/SparsePageSize; i++ {
++		if !sparseBit(m.Data[:], i) {
++			continue
++		}
++		if err := readPage(i, page); err != nil {
++			return uploaded, err
++		}
++		part = append(part, page...)
++		if len(part) == sparsePayloadSize {
++			if err := putPart(); err != nil {
++				return uploaded, err
++			}
++		}
++	}
++	if err := putPart(); err != nil {
++		return uploaded, err
++	}
++	manifest := m.marshal()
++	if err := store.storage.Put(ctx, store.sparseManifestKey(id), bytes.NewReader(manifest)); err != nil {
++		return uploaded, err
++	}
++	uploaded += int64(len(manifest))
++	store.sparseManifestMu.Lock()
++	store.sparseManifests[id] = m
++	store.sparseManifestMu.Unlock()
++	return uploaded, nil
++}
++
++func (store *cachedStore) loadSparseManifest(ctx context.Context, id uint64) (*sparseManifest, error) {
++	store.sparseManifestMu.Lock()
++	m := store.sparseManifests[id]
++	store.sparseManifestMu.Unlock()
++	if m != nil {
++		return m, nil
++	}
++	r, err := store.storage.Get(ctx, store.sparseManifestKey(id), 0, -1)
++	if err != nil {
++		return nil, fmt.Errorf("load sparse manifest %d: %w", id, err)
++	}
++	buf, err := io.ReadAll(r)
++	_ = r.Close()
++	if err != nil {
++		return nil, fmt.Errorf("read sparse manifest %d: %w", id, err)
++	}
++	m, err = unmarshalSparseManifest(buf)
++	if err != nil {
++		return nil, fmt.Errorf("decode sparse manifest %d: %w", id, err)
++	}
++	store.sparseManifestMu.Lock()
++	if old := store.sparseManifests[id]; old != nil {
++		m = old
++	} else {
++		store.sparseManifests[id] = m
++	}
++	store.sparseManifestMu.Unlock()
++	return m, nil
++}
++
++func (store *cachedStore) ReadSparsePage(ctx context.Context, id uint64, page int, data []byte) (SparsePageState, error) {
++	if !IsSparseSliceID(id) || page < 0 || page >= chunkSize/SparsePageSize || len(data) != SparsePageSize {
++		return SparsePageInherit, errors.New("invalid sparse page read")
++	}
++	m, err := store.loadSparseManifest(ctx, id)
++	if err != nil {
++		return SparsePageInherit, err
++	}
++	if sparseBit(m.Zero[:], page) {
++		clear(data)
++		return SparsePageZero, nil
++	}
++	if !sparseBit(m.Data[:], page) {
++		return SparsePageInherit, nil
++	}
++	rank := m.dataRank(page)
++	part := rank * SparsePageSize / sparsePayloadSize
++	off := rank * SparsePageSize % sparsePayloadSize
++	if part >= len(m.PartSizes) || off+SparsePageSize > int(m.PartSizes[part]) {
++		return SparsePageInherit, errors.New("sparse page offset outside payload")
++	}
++	r, err := store.storage.Get(ctx, store.sparsePartKey(id, part, m.PartSizes[part]), int64(off), SparsePageSize)
++	if err != nil {
++		return SparsePageInherit, fmt.Errorf("load sparse payload %d page %d: %w", id, page, err)
++	}
++	_, err = io.ReadFull(r, data)
++	_ = r.Close()
++	if err != nil {
++		return SparsePageInherit, fmt.Errorf("read sparse payload %d page %d: %w", id, page, err)
++	}
++	return SparsePageData, nil
++}
++
++func (store *cachedStore) ReadSparsePages(ctx context.Context, id uint64, firstPage int, states []SparsePageState, data []byte) error {
++	if !IsSparseSliceID(id) || firstPage < 0 || firstPage+len(states) > chunkSize/SparsePageSize ||
++		len(data) != len(states)*SparsePageSize {
++		return errors.New("invalid sparse page range read")
++	}
++	m, err := store.loadSparseManifest(ctx, id)
++	if err != nil {
++		return err
++	}
++	for i := range states {
++		page := firstPage + i
++		switch {
++		case sparseBit(m.Zero[:], page):
++			states[i] = SparsePageZero
++			clear(data[i*SparsePageSize : (i+1)*SparsePageSize])
++		case sparseBit(m.Data[:], page):
++			states[i] = SparsePageData
++		default:
++			states[i] = SparsePageInherit
++		}
++	}
++
++	for i := 0; i < len(states); {
++		if states[i] != SparsePageData {
++			i++
++			continue
++		}
++		rank := m.dataRank(firstPage + i)
++		part := rank * SparsePageSize / sparsePayloadSize
++		partOffset := rank * SparsePageSize % sparsePayloadSize
++		if part >= len(m.PartSizes) {
++			return errors.New("sparse page range outside payload")
++		}
++		j := i + 1
++		for j < len(states) {
++			if states[j] != SparsePageData {
++				j++
++				continue
++			}
++			nextRank := m.dataRank(firstPage + j)
++			if nextRank*SparsePageSize/sparsePayloadSize != part {
++				break
++			}
++			j++
++		}
++		dataPages := 0
++		for k := i; k < j; k++ {
++			if states[k] == SparsePageData {
++				dataPages++
++			}
++		}
++		size := dataPages * SparsePageSize
++		if partOffset+size > int(m.PartSizes[part]) {
++			return errors.New("sparse page range outside payload part")
++		}
++		r, err := store.storage.Get(ctx, store.sparsePartKey(id, part, m.PartSizes[part]), int64(partOffset), int64(size))
++		if err != nil {
++			return fmt.Errorf("load sparse payload %d pages %d-%d: %w", id, firstPage+i, firstPage+j-1, err)
++		}
++		var readErr error
++		if dataPages == j-i {
++			_, readErr = io.ReadFull(r, data[i*SparsePageSize:j*SparsePageSize])
++		} else {
++			packed := make([]byte, size)
++			_, readErr = io.ReadFull(r, packed)
++			off := 0
++			for k := i; k < j; k++ {
++				if states[k] == SparsePageData {
++					copy(data[k*SparsePageSize:(k+1)*SparsePageSize], packed[off:off+SparsePageSize])
++					off += SparsePageSize
++				}
++			}
++		}
++		_ = r.Close()
++		if readErr != nil {
++			return fmt.Errorf("read sparse payload %d pages %d-%d: %w", id, firstPage+i, firstPage+j-1, readErr)
++		}
++		i = j
++	}
++	return nil
++}
++
++func (store *cachedStore) RemoveSparse(id uint64) error {
++	store.sparseStageMu.Lock()
++	remover := store.sparseStageRemover
++	store.sparseStageMu.Unlock()
++	if remover != nil {
++		if err := remover(id); err != nil {
++			return err
++		}
++	}
++
++	ctx := context.Background()
++	objects, err := object.ListAll(ctx, store.storage, store.sparsePrefix(id), "", false, false)
++	if err != nil {
++		return err
++	}
++	for obj := range objects {
++		if obj == nil {
++			return errors.New("list sparse objects failed")
++		}
++		if obj.IsDir() {
++			continue
++		}
++		if err := store.storage.Delete(ctx, obj.Key()); err != nil {
++			return err
++		}
++	}
++	store.sparseManifestMu.Lock()
++	delete(store.sparseManifests, id)
++	store.sparseManifestMu.Unlock()
++	return nil
++}
++
++func (store *cachedStore) SetSparseStageRemover(remover func(uint64) error) {
++	store.sparseStageMu.Lock()
++	store.sparseStageRemover = remover
++	store.sparseStageMu.Unlock()
++}
++
++var _ SparseChunkStore = (*cachedStore)(nil)
+diff --git a/pkg/meta/backup.go b/pkg/meta/backup.go
+index 834cfd4aaeec6effd810ba72a97858eda1fe483c..d7d295706aff3fbbc7b1237fb21de7955fbddf41 100644
+--- a/pkg/meta/backup.go
++++ b/pkg/meta/backup.go
+@@ -669,12 +669,12 @@ func (c *DumpedCounters) updateFromSegment(seg *BakSegment, counters *[]*pb.Coun
+ 		for _, chunk := range seg.val.(*pb.Batch).Chunks {
+ 			recordInode(chunk.Inode)
+ 			for _, s := range readSliceBuf(chunk.Slices) {
+-				c.NextChunk = max(c.NextChunk, int64(s.id)+1)
++				c.NextChunk = max(c.NextChunk, int64(s.id&^SparseSliceBit)+1)
+ 			}
+ 		}
+ 	case segTypeSliceRef:
+ 		for _, ref := range seg.val.(*pb.Batch).SliceRefs {
+-			c.NextChunk = max(c.NextChunk, int64(ref.Id)+1)
++			c.NextChunk = max(c.NextChunk, int64(ref.Id&^SparseSliceBit)+1)
+ 		}
+ 	case segTypeSustained:
+ 		for _, sustained := range seg.val.(*pb.Batch).Sustained {
+diff --git a/pkg/meta/base.go b/pkg/meta/base.go
+index 588b09034ee2d87da04b02759fbdbf798c0fab98..3ca414bf0f05abe9d73df2f9a04ba3b80c7f903d 100644
+--- a/pkg/meta/base.go
++++ b/pkg/meta/base.go
+@@ -2211,9 +2211,13 @@ func (m *baseMeta) Read(ctx Context, inode Ino, indx uint32, slices *[]Slice) (s
+ 		return 0
+ 	}
+ 
++	sparse := hasSparseSlice(ss)
+ 	*slices = buildSlice(ss)
+ 	m.of.CacheChunk(inode, indx, *slices)
+-	if !m.conf.ReadOnly && (len(ss) >= 5 || len(*slices) >= 5) {
++	if sparse {
++		m.of.CacheOverlayChunk(inode, indx, buildOverlaySlices(ss))
++	}
++	if !sparse && !m.conf.ReadOnly && (len(ss) >= 5 || len(*slices) >= 5) {
+ 		tierID := -1
+ 		if f != nil {
+ 			tierID = int(f.attr.Tier)
+@@ -2223,6 +2227,49 @@ func (m *baseMeta) Read(ctx Context, inode Ino, indx uint32, slices *[]Slice) (s
+ 	return 0
+ }
+ 
++func (m *baseMeta) ReadOverlay(ctx Context, inode Ino, indx uint32, slices *[]OverlaySlice) syscall.Errno {
++	if ss, ok := m.of.ReadOverlayChunk(inode, indx); ok {
++		*slices = ss
++		return 0
++	}
++	ss, st := m.en.doRead(ctx, inode, indx)
++	if st != 0 {
++		return st
++	}
++	if ss == nil {
++		return syscall.EIO
++	}
++	if hasSparseSlice(ss) {
++		*slices = buildOverlaySlices(ss)
++		m.of.CacheOverlayChunk(inode, indx, *slices)
++		return 0
++	}
++	dense := buildSlice(ss)
++	*slices = make([]OverlaySlice, 0, len(dense))
++	var pos uint32
++	for _, s := range dense {
++		*slices = append(*slices, OverlaySlice{Slice: s, Pos: pos})
++		pos += s.Len
++	}
++	m.of.CacheOverlayChunk(inode, indx, *slices)
++	return 0
++}
++
++func (m *baseMeta) ReadHybrid(ctx Context, inode Ino, indx uint32, slices *[]Slice, overlays *[]OverlaySlice) (bool, syscall.Errno) {
++	if st := m.Read(ctx, inode, indx, slices); st != 0 {
++		return false, st
++	}
++	for _, s := range *slices {
++		if IsSparseSliceID(s.Id) {
++			if st := m.ReadOverlay(ctx, inode, indx, overlays); st != 0 {
++				return true, st
++			}
++			return true, 0
++		}
++	}
++	return false, 0
++}
++
+ func (m *baseMeta) NewSlice(ctx Context, id *uint64) syscall.Errno {
+ 	m.freeMu.Lock()
+ 	defer m.freeMu.Unlock()
+@@ -2255,6 +2302,14 @@ func (m *baseMeta) Close(ctx Context, inode Ino) syscall.Errno {
+ }
+ 
+ func (m *baseMeta) Write(ctx Context, inode Ino, indx uint32, off uint32, slice Slice, mtime time.Time) syscall.Errno {
++	return m.write(ctx, inode, indx, off, slice, mtime)
++}
++
++func (m *baseMeta) WriteEOF(ctx Context, inode Ino, indx uint32, off uint32, slice Slice, mtime time.Time, eof uint64) syscall.Errno {
++	return m.write(WithFileLength(ctx, eof), inode, indx, off, slice, mtime)
++}
++
++func (m *baseMeta) write(ctx Context, inode Ino, indx uint32, off uint32, slice Slice, mtime time.Time) syscall.Errno {
+ 	defer m.timeit("Write", time.Now())
+ 	f := m.of.find(inode)
+ 	if f != nil {
+@@ -2933,6 +2988,11 @@ func (m *baseMeta) compactChunk(inode Ino, indx uint32, once, force bool, tierID
+ 	if st != 0 {
+ 		return
+ 	}
++	if hasSparseSlice(ss) {
++		// TODO: compact sparse manifests without applying dense overlay rules.
++		logger.Debugf("skip compaction for sparse chunk %d:%d", inode, indx)
++		return
++	}
+ 	if ss == nil {
+ 		logger.Errorf("Corrupt value for inode %d chunk indx %d", inode, indx)
+ 		return
+diff --git a/pkg/meta/changelog.go b/pkg/meta/changelog.go
+index a5f55809bdf0399109f160b85133264247790658..9665450db7951fd7ab865490ea9143a3649f4397 100644
+--- a/pkg/meta/changelog.go
++++ b/pkg/meta/changelog.go
+@@ -243,6 +243,12 @@ func (e *ChangeEntry) Validate() error {
+ 		}
+ 		return nil
+ 	}
++	if e.Op == OpWrite {
++		if len(e.Result) != 1 || (len(e.Args) != 7 && len(e.Args) != 8) {
++			return fmt.Errorf("%s: expect 7 or 8 arguments and 1 result, got (args=%d, results=%d)", e.Op, len(e.Args), len(e.Result))
++		}
++		return nil
++	}
+ 	if e.Op == OpCloneBatch {
+ 		// parent, mode, umask, uid, gids, (srcInode, name)... : dstInode...
+ 		if len(e.Args) < 7 || (len(e.Args)-5)%2 != 0 {
+diff --git a/pkg/meta/changelog_replay.go b/pkg/meta/changelog_replay.go
+index 5c3118587417edaad7f40f87aace973d387d8a04..c87c2d87504e1dc6764ce0ab84651a5c7bcfd70e 100644
+--- a/pkg/meta/changelog_replay.go
++++ b/pkg/meta/changelog_replay.go
+@@ -859,7 +859,15 @@ func (r *Replayer) write(ctx Context, e *ChangeEntry) error {
+ 		return err
+ 	}
+ 	slice := Slice{Id: sliceId, Size: sliceLen, Len: sliceLen}
+-	return changelogCall(e, r.dst.Write(ctx, inode, indx, off, slice, time.Unix(mtime, int64(mtimensec))))
++	ts := time.Unix(mtime, int64(mtimensec))
++	if len(e.Args) == 8 {
++		eof, err := e.Uint64(7)
++		if err != nil {
++			return err
++		}
++		return changelogCall(e, r.dst.WriteEOF(ctx, inode, indx, off, slice, ts, eof))
++	}
++	return changelogCall(e, r.dst.Write(ctx, inode, indx, off, slice, ts))
+ }
+ 
+ func (r *Replayer) compactChunk(ctx Context, e *ChangeEntry) error {
+diff --git a/pkg/meta/context.go b/pkg/meta/context.go
+index 98ba4ae3305b31810f6ba900544e5010bbcefe51..0dcf8c7e94545441c2ed1e42fbc5c1c7d91831e8 100644
+--- a/pkg/meta/context.go
++++ b/pkg/meta/context.go
+@@ -23,6 +23,22 @@ import (
+ 
+ type CtxKey string
+ 
++const fileLengthKey CtxKey = "sparseFileLength"
++
++// WithFileLength carries the real EOF for a Write whose logical slice coverage
++// is larger than the file. The stored slice is unchanged.
++func WithFileLength(ctx Context, length uint64) Context {
++	return ctx.WithValue(fileLengthKey, length)
++}
++
++func fileLengthFrom(ctx Context) (uint64, bool) {
++	if ctx == nil {
++		return 0, false
++	}
++	n, ok := ctx.Value(fileLengthKey).(uint64)
++	return n, ok
++}
++
+ type Context interface {
+ 	context.Context
+ 	Gid() uint32
+diff --git a/pkg/meta/dump.go b/pkg/meta/dump.go
+index 184ee67c38e308e45aedf8bd3ae817da89fff54d..b93694ee8632f2cc7a4e10865cb443031019da62 100644
+--- a/pkg/meta/dump.go
++++ b/pkg/meta/dump.go
+@@ -619,8 +619,9 @@ func decodeEntry(dec *json.Decoder, parent Ino, cs *DumpedCounters, parents map[
+ 						if addChunk != nil && refs[ck] == 1 {
+ 							addChunk(&ck)
+ 						}
+-						if cs.NextChunk <= int64(s.Id) {
+-							cs.NextChunk = int64(s.Id) + 1
++						counterID := s.Id &^ SparseSliceBit
++						if cs.NextChunk <= int64(counterID) {
++							cs.NextChunk = int64(counterID) + 1
+ 						}
+ 					}
+ 				}
+diff --git a/pkg/meta/interface.go b/pkg/meta/interface.go
+index 339f01a282a6dcf4410cd77dda385afc5a34393d..c726bf3520b1f9149a02eacf1604ce75711eeeee 100644
+--- a/pkg/meta/interface.go
++++ b/pkg/meta/interface.go
+@@ -33,12 +33,19 @@ import (
+ )
+ 
+ const (
++	// DefaultFormatVersion remains readable by unmodified community clients.
++	DefaultFormatVersion = 1
+ 	// MaxVersion is the max of supported versions.
+-	MaxVersion = 1
++	MaxVersion = 2
++	// SparseFormatVersion rejects clients that do not understand packed sparse slices.
++	SparseFormatVersion = 2
+ 	// ChunkBits is the size of a chunk.
+ 	ChunkBits = 26
+ 	// ChunkSize is size of a chunk
+ 	ChunkSize = 1 << ChunkBits // 64M
++	// SparseSliceBit marks manifest-backed sparse slices while remaining
++	// positive in signed 64-bit SQL columns.
++	SparseSliceBit uint64 = 1 << 62
+ 	// DeleteSlice is a message to delete a slice from object store.
+ 	DeleteSlice = 1000
+ 	// CompactChunk is a message to compact a chunk in object store.
+@@ -57,6 +64,8 @@ const (
+ 	OpSummary = 1007
+ 	// CompactPath is a message to trigger compact
+ 	CompactPath = 1008
++	// FlushStaging is a message to publish sparse staging generations.
++	FlushStaging = 1009
+ )
+ 
+ const (
+@@ -343,6 +352,26 @@ type Slice struct {
+ 	Len  uint32
+ }
+ 
++func IsSparseSliceID(id uint64) bool {
++	return id&SparseSliceBit != 0
++}
++
++type OverlaySlice struct {
++	Slice
++	Pos uint32
++}
++
++// OverlayReader exposes positioned write records for sparse-aware clients.
++// It is separate from Meta so third-party Meta implementations remain source
++// compatible until sparse slices are enabled.
++type OverlayReader interface {
++	ReadOverlay(ctx Context, inode Ino, indx uint32, slices *[]OverlaySlice) syscall.Errno
++}
++
++type HybridReader interface {
++	ReadHybrid(ctx Context, inode Ino, indx uint32, slices *[]Slice, overlays *[]OverlaySlice) (bool, syscall.Errno)
++}
++
+ // Summary represents the total number of files/directories and
+ // total length of all files inside a directory.
+ type Summary struct {
+@@ -504,6 +533,9 @@ type Meta interface {
+ 	NewSlice(ctx Context, id *uint64) syscall.Errno
+ 	// Write put a slice of data on top of the given chunk.
+ 	Write(ctx Context, inode Ino, indx uint32, off uint32, slice Slice, mtime time.Time) syscall.Errno
++	// WriteEOF is Write with an explicit real EOF. It is used by sparse slices
++	// whose logical coverage is a full chunk but whose file may be shorter.
++	WriteEOF(ctx Context, inode Ino, indx uint32, off uint32, slice Slice, mtime time.Time, eof uint64) syscall.Errno
+ 	// InvalidateChunkCache invalidate chunk cache
+ 	InvalidateChunkCache(ctx Context, inode Ino, indx uint32) syscall.Errno
+ 	// CopyFileRange copies part of a file to another one.
+diff --git a/pkg/meta/openfile.go b/pkg/meta/openfile.go
+index 9f0ecf6e5e20229f02c8c60d3cc04bbf68d433dd..5e55326f4229d7acbbaadf87e49df33582ca4bff 100644
+--- a/pkg/meta/openfile.go
++++ b/pkg/meta/openfile.go
+@@ -23,13 +23,19 @@ type openFile struct {
+ 	lastCheck int64
+ 	first     []Slice
+ 	chunks    map[uint32][]Slice
++	firstRaw  []OverlaySlice
++	rawChunks map[uint32][]OverlaySlice
+ }
+ 
+ func (o *openFile) invalidateChunk() {
+ 	o.first = nil
++	o.firstRaw = nil
+ 	for c := range o.chunks {
+ 		delete(o.chunks, c)
+ 	}
++	for c := range o.rawChunks {
++		delete(o.rawChunks, c)
++	}
+ }
+ 
+ func (o *openFile) release() {
+@@ -38,6 +44,8 @@ func (o *openFile) release() {
+ 	o.lastCheck = 0
+ 	o.first = nil
+ 	o.chunks = nil
++	o.firstRaw = nil
++	o.rawChunks = nil
+ 	ofPool.Put(o)
+ }
+ 
+@@ -235,6 +243,37 @@ func (o *openfiles) CacheChunk(ino Ino, indx uint32, cs []Slice) {
+ 	}
+ }
+ 
++func (o *openfiles) ReadOverlayChunk(ino Ino, indx uint32) ([]OverlaySlice, bool) {
++	o.Lock()
++	defer o.Unlock()
++	of, ok := o.files[ino]
++	if !ok {
++		return nil, false
++	}
++	if indx == 0 {
++		return of.firstRaw, of.firstRaw != nil
++	}
++	cs, ok := of.rawChunks[indx]
++	return cs, ok
++}
++
++func (o *openfiles) CacheOverlayChunk(ino Ino, indx uint32, cs []OverlaySlice) {
++	o.Lock()
++	defer o.Unlock()
++	of, ok := o.files[ino]
++	if !ok {
++		return
++	}
++	if indx == 0 {
++		of.firstRaw = cs
++	} else {
++		if of.rawChunks == nil {
++			of.rawChunks = make(map[uint32][]OverlaySlice)
++		}
++		of.rawChunks[indx] = cs
++	}
++}
++
+ func (o *openfiles) InvalidateChunk(ino Ino, indx uint32) {
+ 	o.Lock()
+ 	defer o.Unlock()
+@@ -244,8 +283,10 @@ func (o *openfiles) InvalidateChunk(ino Ino, indx uint32) {
+ 			of.invalidateChunk()
+ 		} else if indx == 0 {
+ 			of.first = nil
++			of.firstRaw = nil
+ 		} else {
+ 			delete(of.chunks, indx)
++			delete(of.rawChunks, indx)
+ 		}
+ 		of.lastCheck = 0
+ 	}
+diff --git a/pkg/meta/redis.go b/pkg/meta/redis.go
+index 5cfdfb076e1835b4170f5df68eaf4ce37c8b8650..c58cf9860cd13eeb1720b97ca32202df4347aa92 100644
+--- a/pkg/meta/redis.go
++++ b/pkg/meta/redis.go
+@@ -3209,7 +3209,7 @@ func (m *redisMeta) doWrite(ctx Context, inode Ino, indx uint32, off uint32, sli
+ 		if attr.Typ != TypeFile {
+ 			return syscall.EPERM
+ 		}
+-		newleng := uint64(indx)*ChunkSize + uint64(off) + uint64(slice.Len)
++		newleng := sliceCommitLength(ctx, indx, off, slice)
+ 		if newleng > attr.Length {
+ 			delta.length = int64(newleng - attr.Length)
+ 			delta.space = align4K(newleng) - align4K(attr.Length)
+@@ -3224,23 +3224,40 @@ func (m *redisMeta) doWrite(ctx Context, inode Ino, indx uint32, off uint32, sli
+ 		attr.Ctime = now.Unix()
+ 		attr.Ctimensec = uint32(now.Nanosecond())
+ 
++		duplicateSparse := false
++		if IsSparseSliceID(slice.Id) {
++			vals, listErr := tx.LRange(ctx, m.chunkKey(inode, indx), 0, -1).Result()
++			if listErr != nil {
++				return listErr
++			}
++			if existing := findSliceByID(readSlices(vals), slice.Id); existing != nil {
++				if !sameSliceRecord(existing, off, slice) {
++					return syscall.EINVAL
++				}
++				duplicateSparse = true
++				*numSlices = len(vals)
++			}
++		}
+ 		var rpush *redis.IntCmd
+ 		_, err = tx.TxPipelined(ctx, func(pipe redis.Pipeliner) error {
++			if !duplicateSparse {
+ 				rpush = pipe.RPush(ctx, m.chunkKey(inode, indx), marshalSlice(off, slice.Id, slice.Size, slice.Off, slice.Len))
++			}
+ 			// most of chunk are used by single inode, so use that as the default (1 == not exists)
+ 			// pipe.Incr(ctx, r.sliceKey(slice.ID, slice.Size))
+ 			pipe.Set(ctx, m.inodeKey(inode), m.marshal(attr), 0)
+ 			if delta.space > 0 {
+ 				pipe.IncrBy(ctx, m.usedSpaceKey(), delta.space)
+ 			}
+-			m.genLog(ctx, pipe, now, "WRITE(%d,%d,%d,%d,%d,%d,%d):%d", inode, indx, off, slice.Id, slice.Len, attr.Mtime, attr.Mtimensec, *numSlices)
++			format, args := writeLogArgs(ctx, inode, indx, off, slice, attr.Mtime, attr.Mtimensec, *numSlices)
++			m.genLog(ctx, pipe, now, format, args...)
+ 			return nil
+ 		})
+-		if err == nil {
++		if err == nil && rpush != nil {
+ 			*numSlices = int(rpush.Val())
+ 		}
+ 		return err
+-	}, m.inodeKey(inode)))
++	}, m.inodeKey(inode), m.chunkKey(inode, indx)))
+ }
+ 
+ func (m *redisMeta) CopyFileRange(ctx Context, fin Ino, offIn uint64, fout Ino, offOut uint64, size uint64, flags uint32, copied, outLength *uint64) syscall.Errno {
+diff --git a/pkg/meta/slice.go b/pkg/meta/slice.go
+index 59d4b37f698c066b44904eedfe8a7fe554f9877e..cac20f2313e158f43d716050b53a32d5ec396b46 100644
+--- a/pkg/meta/slice.go
++++ b/pkg/meta/slice.go
+@@ -131,6 +131,40 @@ func readSliceBuf(buf []byte) []*slice {
+ 	return ss
+ }
+ 
++func findSliceByID(ss []*slice, id uint64) *slice {
++	for _, s := range ss {
++		if s.id == id {
++			return s
++		}
++	}
++	return nil
++}
++
++func sameSliceRecord(s *slice, pos uint32, value Slice) bool {
++	return s != nil && s.pos == pos && s.id == value.Id && s.size == value.Size &&
++		s.off == value.Off && s.len == value.Len
++}
++
++func sliceCommitLength(ctx Context, indx, off uint32, slice Slice) uint64 {
++	if length, ok := fileLengthFrom(ctx); ok {
++		return length
++	}
++	return uint64(indx)*ChunkSize + uint64(off) + uint64(slice.Len)
++}
++
++func writeLogArgs(ctx Context, inode Ino, indx, off uint32, slice Slice, mtime int64, mtimensec uint32, numSlices int) (string, []any) {
++	implied := uint64(indx)*ChunkSize + uint64(off) + uint64(slice.Len)
++	args := []any{inode, indx, off, slice.Id, slice.Len, mtime, mtimensec}
++	format := "WRITE(%d,%d,%d,%d,%d,%d,%d"
++	if length, ok := fileLengthFrom(ctx); ok && length != implied {
++		format += ",%d"
++		args = append(args, length)
++	}
++	format += "):%d"
++	args = append(args, numSlices)
++	return format, args
++}
++
+ func buildSlice(ss []*slice) []Slice {
+ 	var root *slice
+ 	for i := range ss {
+@@ -154,6 +188,29 @@ func buildSlice(ss []*slice) []Slice {
+ 	return chunk
+ }
+ 
++func hasSparseSlice(ss []*slice) bool {
++	for _, s := range ss {
++		if IsSparseSliceID(s.id) {
++			return true
++		}
++	}
++	return false
++}
++
++// buildOverlaySlices preserves persisted write order and positions when a
++// sparse slice is present. Sparse readers need older overlapping records so an
++// unmaterialized page can inherit from the previous generation.
++func buildOverlaySlices(ss []*slice) []OverlaySlice {
++	chunk := make([]OverlaySlice, 0, len(ss))
++	for _, s := range ss {
++		chunk = append(chunk, OverlaySlice{
++			Slice: Slice{Id: s.id, Size: s.size, Off: s.off, Len: s.len},
++			Pos:   s.pos,
++		})
++	}
++	return chunk
++}
++
+ func compactChunk(ss []*slice) (uint32, uint32, []Slice) {
+ 	var chunk = buildSlice(ss)
+ 	var pos uint32
+diff --git a/pkg/meta/sparse_test.go b/pkg/meta/sparse_test.go
+new file mode 100644
+index 0000000000000000000000000000000000000000..4919e046f799826b1a7f57ac103f1c1ae00ee11f
+--- /dev/null
++++ b/pkg/meta/sparse_test.go
+@@ -0,0 +1,106 @@
++/*
++ * JuiceFS, Copyright 2026 Juicedata, Inc.
++ *
++ * Licensed under the Apache License, Version 2.0 (the "License");
++ * you may not use this file except in compliance with the License.
++ * You may obtain a copy of the License at
++ *
++ *     http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++package meta
++
++import (
++	"os"
++	"path/filepath"
++	"syscall"
++	"testing"
++	"time"
++
++	"github.com/juicedata/juicefs/pkg/meta/pb"
++	"github.com/stretchr/testify/require"
++)
++
++func TestSparseSlicePositiveIDAndEOF(t *testing.T) {
++	cases := []struct {
++		name string
++		url  func(*testing.T) string
++	}{
++		{"tkv", func(t *testing.T) string { return "memkv://sparse-" + t.Name() }},
++		{"sql", func(t *testing.T) string { return "sqlite3://" + filepath.Join(t.TempDir(), "sparse.db") }},
++	}
++	if redisAddr := os.Getenv("REDIS_ADDR"); redisAddr != "" {
++		cases = append(cases, struct {
++			name string
++			url  func(*testing.T) string
++		}{"redis", func(*testing.T) string { return redisAddr }})
++	}
++	for _, tc := range cases {
++		t.Run(tc.name, func(t *testing.T) {
++			m := NewClient(tc.url(t), DefaultConf())
++			if tc.name == "redis" {
++				require.NoError(t, m.Reset())
++			}
++			require.NoError(t, m.Init(&Format{Name: "sparse", BlockSize: 4096, Compression: "none"}, true))
++			t.Cleanup(func() {
++				if tc.name == "redis" {
++					_ = m.Reset()
++				}
++				_ = m.Shutdown()
++			})
++			ctx := Background()
++			var inode Ino
++			var attr Attr
++			require.Zero(t, m.Create(ctx, RootInode, "f", 0644, 0, syscall.O_RDWR, &inode, &attr))
++			var baseID uint64
++			require.Zero(t, m.NewSlice(ctx, &baseID))
++			id := baseID | SparseSliceBit
++			require.Less(t, id, uint64(1<<63))
++			require.Zero(t, m.Write(ctx, inode, 0, 0, Slice{Id: id, Size: 8192, Len: 11}, time.Now()))
++			require.Zero(t, m.GetAttr(ctx, inode, &attr))
++			require.Equal(t, uint64(11), attr.Length)
++			var slices []Slice
++			require.Zero(t, m.Read(ctx, inode, 0, &slices))
++			require.Len(t, slices, 1)
++			require.Equal(t, id, slices[0].Id)
++			overlayReader, ok := m.(OverlayReader)
++			require.True(t, ok)
++			var overlays []OverlaySlice
++			require.Zero(t, overlayReader.ReadOverlay(ctx, inode, 0, &overlays))
++			require.Len(t, overlays, 1)
++			require.Equal(t, id, overlays[0].Id)
++			require.Zero(t, overlays[0].Pos)
++
++			require.Zero(t, m.WriteEOF(ctx, inode, 0, 0, Slice{Id: id, Size: 8192, Len: 11}, time.Now(), 23))
++			require.Zero(t, m.GetAttr(ctx, inode, &attr))
++			require.Equal(t, uint64(23), attr.Length)
++			require.Zero(t, overlayReader.ReadOverlay(ctx, inode, 0, &overlays))
++			require.Len(t, overlays, 1)
++
++			require.Equal(t, syscall.EINVAL,
++				m.WriteEOF(ctx, inode, 0, 0, Slice{Id: id, Size: 4096, Len: 11}, time.Now(), 23))
++		})
++	}
++}
++
++func TestSparseBackupCounterStripsFormatBit(t *testing.T) {
++	const id = uint64(12345)
++	segment := &BakSegment{
++		typ: segTypeChunk,
++		val: &pb.Batch{Chunks: []*pb.Chunk{{
++			Inode:  2,
++			Index:  0,
++			Slices: marshalSlice(0, id|SparseSliceBit, ChunkSize, 0, ChunkSize),
++		}}},
++	}
++	var counters []*pb.Counter
++	var dumped DumpedCounters
++	require.False(t, dumped.updateFromSegment(segment, &counters))
++	require.Equal(t, int64(id+1), dumped.NextChunk)
++}
+diff --git a/pkg/meta/sql.go b/pkg/meta/sql.go
+index ace5ce3d1b8026fe7acdf2631b7ce122a094f911..9ce3714342cd34e57fb2560b17e6579be628872e 100644
+--- a/pkg/meta/sql.go
++++ b/pkg/meta/sql.go
+@@ -3572,7 +3572,7 @@ func (m *dbMeta) doWrite(ctx Context, inode Ino, indx uint32, off uint32, slice
+ 		if nodeAttr.Type != TypeFile {
+ 			return syscall.EPERM
+ 		}
+-		newleng := uint64(indx)*ChunkSize + uint64(off) + uint64(slice.Len)
++		newleng := sliceCommitLength(ctx, indx, off, slice)
+ 		if newleng > nodeAttr.Length {
+ 			delta.length = int64(newleng - nodeAttr.Length)
+ 			delta.space = align4K(newleng) - align4K(nodeAttr.Length)
+@@ -3587,21 +3587,41 @@ func (m *dbMeta) doWrite(ctx Context, inode Ino, indx uint32, off uint32, slice
+ 		m.parseAttr(&nodeAttr, attr)
+ 
+ 		buf := marshalSlice(off, slice.Id, slice.Size, slice.Off, slice.Len)
++		duplicateSparse := false
+ 		var insert bool // no compaction check for the first slice
++		if IsSparseSliceID(slice.Id) {
++			ck := chunk{Inode: inode, Indx: indx}
++			ok, getErr := s.ForUpdate().MustCols("indx").Get(&ck)
++			if getErr != nil {
++				return getErr
++			}
++			if ok {
++				if existing := findSliceByID(readSliceBuf(ck.Slices), slice.Id); existing != nil {
++					if !sameSliceRecord(existing, off, slice) {
++						return syscall.EINVAL
++					}
++					duplicateSparse = true
++					*numSlices = len(ck.Slices) / sliceBytes
++				}
++			}
++		}
++		if !duplicateSparse {
+ 			if err = m.upsertSlice(s, inode, indx, buf, &insert); err != nil {
+ 				return err
+ 			}
+ 			if err = mustInsert(s, sliceRef{slice.Id, slice.Size, 1}); err != nil {
+ 				return err
+ 			}
++		}
+ 		_, err = s.Cols("length", "mtime", "ctime", "mtimensec", "ctimensec").Update(&nodeAttr, &node{Inode: inode})
+-		if err == nil && !insert {
++		if err == nil && !insert && !duplicateSparse {
+ 			ck := chunk{Inode: inode, Indx: indx}
+ 			_, _ = s.MustCols("indx").Get(&ck)
+ 			*numSlices = len(ck.Slices) / sliceBytes
+ 		}
+ 		if err == nil {
+-			m.genLog(ctx, s, now, "WRITE(%d,%d,%d,%d,%d,%d,%d):%d", inode, indx, off, slice.Id, slice.Len, attr.Mtime, attr.Mtimensec, *numSlices)
++			format, args := writeLogArgs(ctx, inode, indx, off, slice, attr.Mtime, attr.Mtimensec, *numSlices)
++			m.genLog(ctx, s, now, format, args...)
+ 		}
+ 		return err
+ 	}, inode))
+diff --git a/pkg/meta/tkv.go b/pkg/meta/tkv.go
+index a5c096666eb10c27a006bff3480aab4445245742..25ffa33516be1aad5bd368dff30fa326debc702f 100644
+--- a/pkg/meta/tkv.go
++++ b/pkg/meta/tkv.go
+@@ -2763,7 +2763,7 @@ func (m *kvMeta) doWrite(ctx Context, inode Ino, indx uint32, off uint32, slice
+ 			logger.Errorf("Invalid chunk value for inode %d indx %d: %d", inode, indx, len(rs[1]))
+ 			return syscall.EIO
+ 		}
+-		newleng := uint64(indx)*ChunkSize + uint64(off) + uint64(slice.Len)
++		newleng := sliceCommitLength(ctx, indx, off, slice)
+ 		if newleng > attr.Length {
+ 			delta.length = int64(newleng - attr.Length)
+ 			delta.space = align4K(newleng) - align4K(attr.Length)
+@@ -2778,17 +2778,31 @@ func (m *kvMeta) doWrite(ctx Context, inode Ino, indx uint32, off uint32, slice
+ 		attr.Ctime = now.Unix()
+ 		attr.Ctimensec = uint32(now.Nanosecond())
+ 		val := marshalSlice(off, slice.Id, slice.Size, slice.Off, slice.Len)
++		duplicateSparse := false
+ 		for i := 0; i < len(rs[1]); i += sliceBytes {
++			existing := readSliceBuf(rs[1][i : i+sliceBytes])[0]
++			if IsSparseSliceID(slice.Id) && existing.id == slice.Id {
++				if !sameSliceRecord(existing, off, slice) {
++					return syscall.EINVAL
++				}
++				duplicateSparse = true
++				break
++			}
+ 			if bytes.Equal(rs[1][i:i+sliceBytes], val) {
+ 				logger.Warnf("Write same slice for inode %d indx %d sliceId %d", inode, indx, slice.Id)
+ 				return nil
+ 			}
+ 		}
++		if duplicateSparse {
++			val = rs[1]
++		} else {
+ 			val = append(rs[1], val...)
+-		tx.set(m.inodeKey(inode), m.marshal(attr))
+ 			tx.set(m.chunkKey(inode, indx), val)
++		}
++		tx.set(m.inodeKey(inode), m.marshal(attr))
+ 		*numSlices = len(val) / sliceBytes
+-		m.genLog(tx, now, "WRITE(%d,%d,%d,%d,%d,%d,%d):%d", inode, indx, off, slice.Id, slice.Len, attr.Mtime, attr.Mtimensec, *numSlices)
++		format, args := writeLogArgs(ctx, inode, indx, off, slice, attr.Mtime, attr.Mtimensec, *numSlices)
++		m.genLog(tx, now, format, args...)
+ 		return nil
+ 	}, inode))
+ }
+diff --git a/pkg/vfs/flush_staging.go b/pkg/vfs/flush_staging.go
+new file mode 100644
+index 0000000000000000000000000000000000000000..d564bfdef5078b8572644c6f2d9d6e5672e3739b
+--- /dev/null
++++ b/pkg/vfs/flush_staging.go
+@@ -0,0 +1,138 @@
++/*
++ * JuiceFS, Copyright 2026 Juicedata, Inc.
++ *
++ * Licensed under the Apache License, Version 2.0 (the "License");
++ * you may not use this file except in compliance with the License.
++ * You may obtain a copy of the License at
++ *
++ *     http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++package vfs
++
++import (
++	"syscall"
++
++	"github.com/juicedata/juicefs/pkg/meta"
++)
++
++// FlushStagingResponse is returned to the control client.
++type FlushStagingResponse struct {
++	FileCount  uint64 `json:"fileCount"`
++	SliceCount uint64 `json:"sliceCount"`
++	Async      bool   `json:"async"`
++}
++
++type stagingFile struct {
++	inode Ino
++}
++
++// flushStagingPaths publishes sparse generations for the given paths.
++// Empty paths publish the entire sparse staging area.
++//
++// When background is true, the Put is scheduled asynchronously.
++func (v *VFS) flushStagingPaths(ctx meta.Context, paths []string, background bool) (*FlushStagingResponse, syscall.Errno) {
++	stat := &FlushStagingResponse{Async: background}
++	if v.sparse == nil {
++		logger.Errorf("flush staging requires sparse-chunk-slice")
++		return stat, syscall.ENOTSUP
++	}
++
++	if len(paths) == 0 {
++		logger.Infof("publish sparse staging: all generations (async=%v)", background)
++		if background {
++			go func() {
++				if _, err := v.sparse.PublishAll(); err != nil {
++					logger.Errorf("flush staging (all): %s", err)
++				}
++			}()
++			return stat, 0
++		}
++		n, err := v.sparse.PublishAll()
++		stat.SliceCount = uint64(n)
++		if err != nil {
++			logger.Errorf("publish sparse staging (all): %s", err)
++			return stat, syscall.EIO
++		}
++		return stat, 0
++	}
++
++	files := v.collectStagingFiles(ctx, paths)
++	inodes := make([]meta.Ino, 0, len(files))
++	for _, f := range files {
++		inodes = append(inodes, f.inode)
++		_ = v.writer.Flush(ctx, f.inode)
++		stat.FileCount++
++	}
++	if background {
++		go func() {
++			if _, err := v.sparse.PublishInodes(inodes); err != nil {
++				logger.Errorf("publish sparse staging: %s", err)
++			}
++		}()
++	} else {
++		n, err := v.sparse.PublishInodes(inodes)
++		stat.SliceCount = uint64(n)
++		if err != nil {
++			logger.Errorf("publish sparse staging: %s", err)
++			return stat, syscall.EIO
++		}
++	}
++	logger.Infof("publish sparse staging: %d files, %d slices, async=%v", stat.FileCount, stat.SliceCount, background)
++	return stat, 0
++}
++
++func (v *VFS) collectStagingFiles(ctx meta.Context, paths []string) []stagingFile {
++	filler := NewCacheFiller(v.Conf, v.Meta, v.Store)
++	var files []stagingFile
++	for _, p := range paths {
++		var inode Ino
++		var attr Attr
++		if st := filler.resolve(ctx, p, &inode, &attr); st != 0 {
++			logger.Warnf("flush staging: resolve %q: %s", p, st)
++			continue
++		}
++		switch attr.Typ {
++		case meta.TypeFile:
++			files = append(files, stagingFile{inode})
++		case meta.TypeDirectory:
++			files = append(files, v.listFilesUnder(ctx, inode)...)
++		default:
++			logger.Warnf("flush staging: skip non-file %q (type %d)", p, attr.Typ)
++		}
++	}
++	return files
++}
++
++func (v *VFS) listFilesUnder(ctx meta.Context, root Ino) []stagingFile {
++	var out []stagingFile
++	pending := []Ino{root}
++	for len(pending) > 0 {
++		ino := pending[len(pending)-1]
++		pending = pending[:len(pending)-1]
++		var entries []*meta.Entry
++		if st := v.Meta.Readdir(ctx, ino, 1, &entries); st != 0 {
++			logger.Warnf("flush staging: readdir %d: %s", ino, st)
++			continue
++		}
++		for _, e := range entries {
++			name := string(e.Name)
++			if name == "." || name == ".." {
++				continue
++			}
++			switch e.Attr.Typ {
++			case meta.TypeDirectory:
++				pending = append(pending, e.Inode)
++			case meta.TypeFile:
++				out = append(out, stagingFile{e.Inode})
++			}
++		}
++	}
++	return out
++}
+diff --git a/pkg/vfs/internal.go b/pkg/vfs/internal.go
+index d932d3fbd4753c828a7919ccbcde4c7de2638cd6..f35a27630e8f2fb303d1191a1f5e8f364510a169 100644
+--- a/pkg/vfs/internal.go
++++ b/pkg/vfs/internal.go
+@@ -591,6 +591,41 @@ func (v *VFS) handleInternalMsg(ctx meta.Context, cmd uint32, r *utils.Buffer, o
+ 		writeProgress(&totalChunks, &currChunks, out, done)
+ 		_, _ = out.Write([]byte{uint8(eno)})
+ 
++	case meta.FlushStaging:
++		var paths []string
++		var background uint8 = 1 // default async
++		if r.HasMore() {
++			paths = strings.Split(string(r.Get(int(r.Get32()))), "\n")
++			var cleaned []string
++			for _, p := range paths {
++				p = strings.TrimSpace(p)
++				if p != "" {
++					cleaned = append(cleaned, p)
++				}
++			}
++			paths = cleaned
++			if r.HasMore() {
++				background = r.Get8()
++			}
++		}
++		logger.Infof("flush staging paths=%d background=%d", len(paths), background)
++		stat, eno := v.flushStagingPaths(ctx, paths, background != 0)
++		if eno != 0 {
++			_, _ = out.Write([]byte{uint8(eno)})
++			return
++		}
++		data, err := json.Marshal(stat)
++		if err != nil {
++			logger.Errorf("marshal flush-staging response: %v", err)
++			_, _ = out.Write([]byte{byte(syscall.EIO & 0xff)})
++			return
++		}
++		w := utils.NewBuffer(uint32(1 + 4 + len(data)))
++		w.Put8(meta.CDATA)
++		w.Put32(uint32(len(data)))
++		w.Put(data)
++		_, _ = out.Write(w.Bytes())
++
+ 	case meta.FillCache:
+ 		paths := strings.Split(string(r.Get(int(r.Get32()))), "\n")
+ 		concurrent := r.Get16()
+diff --git a/pkg/vfs/reader.go b/pkg/vfs/reader.go
+index 50b3030dc16b48ae075cf754fcc2681f144e7dfb..4aa2e5533f3cde297ca91c95bb9b875e878e3a84 100644
+--- a/pkg/vfs/reader.go
++++ b/pkg/vfs/reader.go
+@@ -172,8 +172,17 @@ func (s *sliceReader) run() {
+ 	inode := f.inode
+ 	f.Unlock()
+ 
+-	var slices []meta.Slice
+-	err := f.r.m.Read(meta.Background(), inode, indx, &slices)
++	var (
++		slices      []meta.Slice
++		overlays    []meta.OverlaySlice
++		overlayRead bool
++		err         syscall.Errno
++	)
++	if hybridReader, ok := f.r.m.(meta.HybridReader); ok {
++		overlayRead, err = hybridReader.ReadHybrid(meta.Background(), inode, indx, &slices, &overlays)
++	} else {
++		err = f.r.m.Read(meta.Background(), inode, indx, &slices)
++	}
+ 	f.Lock()
+ 	length := f.length
+ 	if s.state != BUSY || f.shouldStop() {
+@@ -215,8 +224,28 @@ func (s *sliceReader) run() {
+ 	defer p.Release()
+ 	var n int
+ 
++	localRead := f.r.sparse != nil && f.r.sparse.beginRead(inode, indx)
+ 	ctx := context.WithValue(s.ctx, meta.CtxKey("inode"), inode) // Output inode in log for debugging
++	if overlayRead {
++		n = f.r.readOverlaySlices(ctx, p, overlays, uint32(s.block.off)%meta.ChunkSize)
++	} else {
+ 		n = f.r.Read(ctx, p, slices, (uint32(s.block.off))%meta.ChunkSize)
++	}
++	if n == int(need) && f.r.sparse != nil {
++		var overlayErr error
++		if localRead {
++			overlayErr = f.r.sparse.overlayLocked(inode, indx, uint32(s.block.off)%meta.ChunkSize, p.Data)
++		} else {
++			overlayErr = f.r.sparse.overlay(inode, indx, uint32(s.block.off)%meta.ChunkSize, p.Data)
++		}
++		if overlayErr != nil {
++			logger.Errorf("read local sparse staging inode %d chunk %d: %s", inode, indx, overlayErr)
++			n = 0
++		}
++	}
++	if localRead {
++		f.r.sparse.endRead()
++	}
+ 
+ 	f.Lock()
+ 	if s.state != BUSY || f.shouldStop() {
+@@ -713,6 +742,7 @@ type dataReader struct {
+ 	sync.Mutex
+ 	m              meta.Meta
+ 	store          chunk.ChunkStore
++	sparse         *sparseStaging
+ 	files          map[Ino]*fileReader
+ 	blockSize      uint64
+ 	bufferSize     int64
+@@ -894,6 +924,104 @@ func (r *dataReader) Read(ctx context.Context, page *chunk.Page, slices []meta.S
+ 	return read
+ }
+ 
++func (r *dataReader) readOverlaySlices(ctx context.Context, page *chunk.Page, slices []meta.OverlaySlice, offset uint32) int {
++	buf := page.Data
++	end := uint64(offset) + uint64(len(buf))
++	sparseStore, sparseOK := r.store.(chunk.SparseChunkStore)
++	if len(slices) == 1 && sparseOK && meta.IsSparseSliceID(slices[0].Id) {
++		s := &slices[0]
++		if r.sparse != nil && r.sparse.hasGeneration(s.Id) {
++			clear(buf)
++			return len(buf)
++		}
++		start := uint64(offset)
++		stop := end
++		sliceStart := uint64(s.Pos)
++		sliceEnd := sliceStart + uint64(s.Len)
++		if start >= sliceStart && stop <= sliceEnd &&
++			start%chunk.SparsePageSize == 0 && stop%chunk.SparsePageSize == 0 {
++			firstPage := int(start) / chunk.SparsePageSize
++			states := make([]chunk.SparsePageState, len(buf)/chunk.SparsePageSize)
++			if err := sparseStore.ReadSparsePages(ctx, s.Id, firstPage, states, buf); err != nil {
++				logger.Errorf("read sparse slice %d pages from %d: %s", s.Id, firstPage, err)
++				return 0
++			}
++			for i, state := range states {
++				if state == chunk.SparsePageInherit {
++					clear(buf[i*chunk.SparsePageSize : (i+1)*chunk.SparsePageSize])
++				}
++			}
++			return len(buf)
++		}
++	}
++	clear(buf)
++	for i := range slices {
++		s := &slices[i]
++		sliceStart := uint64(s.Pos)
++		sliceEnd := sliceStart + uint64(s.Len)
++		start := max(uint64(offset), sliceStart)
++		stop := min(end, sliceEnd)
++		if start >= stop {
++			continue
++		}
++		dstStart := int(start - uint64(offset))
++		dstEnd := int(stop - uint64(offset))
++		if s.Id == 0 {
++			clear(buf[dstStart:dstEnd])
++			continue
++		}
++		if !meta.IsSparseSliceID(s.Id) {
++			p := chunk.NewPage(buf[dstStart:dstEnd])
++			err := r.readSlice(ctx, &s.Slice, p, int(start-sliceStart))
++			p.Release()
++			if err != nil {
++				return 0
++			}
++			continue
++		}
++		if r.sparse != nil && r.sparse.hasGeneration(s.Id) {
++			continue
++		}
++		if !sparseOK {
++			logger.Errorf("sparse slice %d requires sparse-capable chunk store", s.Id)
++			return 0
++		}
++		firstPage := int(start) / chunk.SparsePageSize
++		lastPage := int(stop-1) / chunk.SparsePageSize
++		pageStates := make([]chunk.SparsePageState, lastPage-firstPage+1)
++		if start%chunk.SparsePageSize == 0 && stop%chunk.SparsePageSize == 0 {
++			if err := sparseStore.ReadSparsePages(ctx, s.Id, firstPage, pageStates, buf[dstStart:dstEnd]); err != nil {
++				logger.Errorf("read sparse slice %d pages %d-%d: %s", s.Id, firstPage, lastPage, err)
++				return 0
++			}
++			continue
++		}
++		pageBuf := make([]byte, len(pageStates)*chunk.SparsePageSize)
++		if err := sparseStore.ReadSparsePages(ctx, s.Id, firstPage, pageStates, pageBuf); err != nil {
++			logger.Errorf("read sparse slice %d pages %d-%d: %s", s.Id, firstPage, lastPage, err)
++			return 0
++		}
++		for pageIndex := firstPage; pageIndex <= lastPage; pageIndex++ {
++			state := pageStates[pageIndex-firstPage]
++			if state == chunk.SparsePageInherit {
++				continue
++			}
++			pageStart := uint64(pageIndex * chunk.SparsePageSize)
++			copyStart := max(start, pageStart)
++			copyEnd := min(stop, pageStart+chunk.SparsePageSize)
++			d0 := int(copyStart - uint64(offset))
++			d1 := int(copyEnd - uint64(offset))
++			if state == chunk.SparsePageZero {
++				clear(buf[d0:d1])
++			} else {
++				pageOffset := uint64((pageIndex - firstPage) * chunk.SparsePageSize)
++				copy(buf[d0:d1], pageBuf[pageOffset+copyStart-pageStart:pageOffset+copyEnd-pageStart])
++			}
++		}
++	}
++	return len(buf)
++}
++
+ func (r *dataReader) readManySlices(ctx context.Context, page *chunk.Page, slices []meta.Slice, offset uint32) int {
+ 	read := 0
+ 	var pos uint32
+diff --git a/pkg/vfs/sparse_staging.go b/pkg/vfs/sparse_staging.go
+new file mode 100644
+index 0000000000000000000000000000000000000000..981dbf51bab1dcc2b14908fd7208e3001bbe7cf2
+--- /dev/null
++++ b/pkg/vfs/sparse_staging.go
+@@ -0,0 +1,792 @@
++/*
++ * JuiceFS, Copyright 2026 Juicedata, Inc.
++ *
++ * Licensed under the Apache License, Version 2.0 (the "License");
++ * you may not use this file except in compliance with the License.
++ * You may obtain a copy of the License at
++ *
++ *     http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++package vfs
++
++import (
++	"encoding/binary"
++	"errors"
++	"fmt"
++	"hash/crc32"
++	"os"
++	"path/filepath"
++	"sort"
++	"strings"
++	"sync"
++	"sync/atomic"
++	"syscall"
++	"time"
++
++	"github.com/juicedata/juicefs/pkg/chunk"
++	"github.com/juicedata/juicefs/pkg/meta"
++	"github.com/juicedata/juicefs/pkg/utils"
++)
++
++const (
++	sparseStageHeaderVersion = 1
++	sparseStageSlotSize      = 8 << 10
++	sparseStageDataOffset    = 2 * sparseStageSlotSize
++)
++
++var sparseStageMagic = [8]byte{'J', 'F', 'S', 'S', 'T', 'G', '0', '1'}
++
++type sparseStageKey struct {
++	Inode meta.Ino
++	Chunk uint32
++}
++
++type sparseGeneration struct {
++	Version     uint16 `json:"version"`
++	Inode       meta.Ino
++	Chunk       uint32
++	ID          uint64
++	LogicalSize uint32
++	BaseEOF     uint64
++	RealEOF     uint64
++	Mtime       int64
++	DataBitmap  []byte
++	ZeroBitmap  []byte
++	DataPath    string
++	Frozen      bool
++	Sequence    uint64
++}
++
++type sparseStaging struct {
++	sync.RWMutex
++	publishMu sync.Mutex
++
++	conf   *Config
++	meta   meta.Meta
++	store  chunk.SparseChunkStore
++	reader *dataReader
++	root   string
++
++	active   map[sparseStageKey]*sparseGeneration
++	pending  map[sparseStageKey][]*sparseGeneration
++	byID     map[uint64]*sparseGeneration
++	localIDs sync.Map
++
++	watermarkPublishing atomic.Bool
++}
++
++func newSparseStaging(conf *Config, m meta.Meta, store chunk.ChunkStore, reader DataReader) (*sparseStaging, error) {
++	if conf.Chunk == nil || !conf.Chunk.SparseChunkSlice {
++		return nil, nil
++	}
++	if !conf.Chunk.Writeback {
++		return nil, errors.New("sparse-chunk-slice requires writeback")
++	}
++	sparseStore, ok := store.(chunk.SparseChunkStore)
++	if !ok {
++		return nil, errors.New("chunk store does not support sparse manifests")
++	}
++	dr, ok := reader.(*dataReader)
++	if !ok {
++		return nil, errors.New("data reader does not support sparse staging")
++	}
++	dirs := utils.SplitDir(conf.Chunk.CacheDir)
++	if len(dirs) == 0 || conf.Chunk.CacheDir == "memory" {
++		return nil, errors.New("sparse-chunk-slice requires a disk cache directory")
++	}
++	matches, _ := filepath.Glob(dirs[0])
++	if len(matches) > 0 {
++		dirs[0] = matches[0]
++	}
++	root := filepath.Join(strings.TrimSpace(dirs[0]), "sparse-staging")
++	if err := os.MkdirAll(root, 0700); err != nil {
++		return nil, err
++	}
++	s := &sparseStaging{
++		conf: conf, meta: m, store: sparseStore, reader: dr, root: root,
++		active:  make(map[sparseStageKey]*sparseGeneration),
++		pending: make(map[sparseStageKey][]*sparseGeneration),
++		byID:    make(map[uint64]*sparseGeneration),
++	}
++	if err := s.recover(); err != nil {
++		return nil, err
++	}
++	sparseStore.SetSparseStageRemover(s.removeByID)
++	dr.sparse = s
++	return s, nil
++}
++
++func (s *sparseStaging) path(inode meta.Ino, chunkIndex uint32, id uint64) string {
++	base := fmt.Sprintf("%d-%d-%d", inode, chunkIndex, id)
++	return filepath.Join(s.root, base+".stage")
++}
++
++func (s *sparseStaging) newGenerationLocked(key sparseStageKey, baseEOF, realEOF uint64) (*sparseGeneration, error) {
++	var id uint64
++	if st := s.meta.NewSlice(meta.Background(), &id); st != 0 {
++		return nil, st
++	}
++	if id&chunk.SparseSliceBit != 0 {
++		return nil, errors.New("slice ID space reached sparse discriminator")
++	}
++	id |= chunk.SparseSliceBit
++	dataPath := s.path(key.Inode, key.Chunk, id)
++	f, err := os.OpenFile(dataPath, os.O_CREATE|os.O_EXCL|os.O_RDWR, 0600)
++	if err != nil {
++		return nil, err
++	}
++	err = f.Truncate(sparseStageDataOffset + meta.ChunkSize)
++	_ = f.Close()
++	if err != nil {
++		_ = os.Remove(dataPath)
++		return nil, err
++	}
++	g := &sparseGeneration{
++		Version: 1, Inode: key.Inode, Chunk: key.Chunk, ID: id,
++		LogicalSize: meta.ChunkSize, BaseEOF: baseEOF, RealEOF: realEOF, Mtime: time.Now().UnixNano(),
++		DataBitmap: make([]byte, chunk.SparseBitmapSize),
++		ZeroBitmap: make([]byte, chunk.SparseBitmapSize),
++		DataPath:   dataPath,
++	}
++	s.active[key] = g
++	s.byID[g.ID] = g
++	s.localIDs.Store(g.ID, struct{}{})
++	return g, nil
++}
++
++func bitmapSet(bitmap []byte, page int, value bool) {
++	mask := byte(1 << uint(page&7))
++	if value {
++		bitmap[page>>3] |= mask
++	} else {
++		bitmap[page>>3] &^= mask
++	}
++}
++
++func bitmapGet(bitmap []byte, page int) bool {
++	return bitmap[page>>3]&(1<<uint(page&7)) != 0
++}
++
++func (s *sparseStaging) readGlobalPageLocked(key sparseStageKey, pageIndex int, data []byte) error {
++	clear(data)
++	var slices []meta.Slice
++	if st := s.meta.Read(meta.Background(), key.Inode, key.Chunk, &slices); st != 0 {
++		return st
++	}
++	p := chunk.NewPage(data)
++	var n int
++	sparse := false
++	for _, slice := range slices {
++		if meta.IsSparseSliceID(slice.Id) {
++			sparse = true
++			break
++		}
++	}
++	if sparse {
++		overlayReader, ok := s.meta.(meta.OverlayReader)
++		if !ok {
++			p.Release()
++			return syscall.EIO
++		}
++		var overlays []meta.OverlaySlice
++		if st := overlayReader.ReadOverlay(meta.Background(), key.Inode, key.Chunk, &overlays); st != 0 {
++			p.Release()
++			return st
++		}
++		n = s.reader.readOverlaySlices(meta.Background(), p, overlays, uint32(pageIndex*chunk.SparsePageSize))
++	} else {
++		n = s.reader.Read(meta.Background(), p, slices, uint32(pageIndex*chunk.SparsePageSize))
++	}
++	p.Release()
++	if n != len(data) {
++		return syscall.EIO
++	}
++	return nil
++}
++
++func (s *sparseStaging) applyGenerationPageLocked(g *sparseGeneration, pageIndex int, data []byte) error {
++	if bitmapGet(g.ZeroBitmap, pageIndex) {
++		clear(data)
++		return nil
++	}
++	if !bitmapGet(g.DataBitmap, pageIndex) {
++		return nil
++	}
++	f, err := os.Open(g.DataPath)
++	if err != nil {
++		return err
++	}
++	_, err = f.ReadAt(data, int64(sparseStageDataOffset+pageIndex*chunk.SparsePageSize))
++	_ = f.Close()
++	return err
++}
++
++func (s *sparseStaging) readBasePageLocked(key sparseStageKey, current *sparseGeneration, pageIndex int, data []byte) error {
++	if err := s.readGlobalPageLocked(key, pageIndex, data); err != nil {
++		return err
++	}
++	gens := append([]*sparseGeneration(nil), s.pending[key]...)
++	sort.Slice(gens, func(i, j int) bool { return gens[i].ID < gens[j].ID })
++	for _, g := range gens {
++		if g != current {
++			if err := s.applyGenerationPageLocked(g, pageIndex, data); err != nil {
++				return err
++			}
++		}
++	}
++	return nil
++}
++
++func (s *sparseStaging) Write(inode meta.Ino, off uint64, data []byte, initialLength uint64) error {
++	s.Lock()
++	defer s.Unlock()
++	for len(data) > 0 {
++		key := sparseStageKey{Inode: inode, Chunk: uint32(off / meta.ChunkSize)}
++		chunkOff := uint32(off % meta.ChunkSize)
++		n := min(len(data), int(meta.ChunkSize-chunkOff))
++		g := s.active[key]
++		if g == nil {
++			var err error
++			g, err = s.newGenerationLocked(key, initialLength, max(initialLength, off+uint64(n)))
++			if err != nil {
++				return err
++			}
++		}
++		f, err := os.OpenFile(g.DataPath, os.O_RDWR, 0)
++		if err != nil {
++			return err
++		}
++		written := 0
++		for written < n {
++			pos := int(chunkOff) + written
++			pageIndex := pos / chunk.SparsePageSize
++			inPage := pos % chunk.SparsePageSize
++			take := min(n-written, chunk.SparsePageSize-inPage)
++			var page []byte
++			if inPage == 0 && take == chunk.SparsePageSize {
++				page = data[written : written+take]
++			} else {
++				page = make([]byte, chunk.SparsePageSize)
++				if bitmapGet(g.DataBitmap, pageIndex) {
++					if _, err = f.ReadAt(page, int64(sparseStageDataOffset+pageIndex*chunk.SparsePageSize)); err != nil {
++						_ = f.Close()
++						return err
++					}
++				} else if !bitmapGet(g.ZeroBitmap, pageIndex) {
++					if err = s.readBasePageLocked(key, g, pageIndex, page); err != nil {
++						_ = f.Close()
++						return err
++					}
++				}
++				copy(page[inPage:inPage+take], data[written:written+take])
++			}
++			allZero := true
++			for _, b := range page {
++				if b != 0 {
++					allZero = false
++					break
++				}
++			}
++			if allZero {
++				bitmapSet(g.DataBitmap, pageIndex, false)
++				bitmapSet(g.ZeroBitmap, pageIndex, true)
++			} else {
++				if _, err = f.WriteAt(page, int64(sparseStageDataOffset+pageIndex*chunk.SparsePageSize)); err != nil {
++					_ = f.Close()
++					return err
++				}
++				bitmapSet(g.DataBitmap, pageIndex, true)
++				bitmapSet(g.ZeroBitmap, pageIndex, false)
++			}
++			written += take
++		}
++		_ = f.Close()
++		g.RealEOF = max(g.RealEOF, off+uint64(n))
++		g.Mtime = time.Now().UnixNano()
++		off += uint64(n)
++		data = data[n:]
++	}
++	s.maybeTriggerWatermarkLocked()
++	return nil
++}
++
++func (s *sparseStaging) overlay(inode meta.Ino, chunkIndex uint32, off uint32, data []byte) error {
++	s.RLock()
++	defer s.RUnlock()
++	return s.overlayLocked(inode, chunkIndex, off, data)
++}
++
++func (s *sparseStaging) overlayLocked(inode meta.Ino, chunkIndex uint32, off uint32, data []byte) error {
++	key := sparseStageKey{Inode: inode, Chunk: chunkIndex}
++	gens := append([]*sparseGeneration(nil), s.pending[key]...)
++	if g := s.active[key]; g != nil {
++		gens = append(gens, g)
++	}
++	sort.Slice(gens, func(i, j int) bool { return gens[i].ID < gens[j].ID })
++	for _, g := range gens {
++		start := int(off)
++		end := start + len(data)
++		if start >= int(g.LogicalSize) {
++			continue
++		}
++		end = min(end, int(g.LogicalSize))
++		firstPage := start / chunk.SparsePageSize
++		lastPage := (end - 1) / chunk.SparsePageSize
++		page := make([]byte, chunk.SparsePageSize)
++		for pageIndex := firstPage; pageIndex <= lastPage; pageIndex++ {
++			if !bitmapGet(g.DataBitmap, pageIndex) && !bitmapGet(g.ZeroBitmap, pageIndex) {
++				continue
++			}
++			if err := s.applyGenerationPageLocked(g, pageIndex, page); err != nil {
++				return err
++			}
++			pageStart := pageIndex * chunk.SparsePageSize
++			copyStart := max(start, pageStart)
++			copyEnd := min(end, pageStart+chunk.SparsePageSize)
++			copy(data[copyStart-start:copyEnd-start], page[copyStart-pageStart:copyEnd-pageStart])
++		}
++	}
++	return nil
++}
++
++func (s *sparseStaging) beginRead(inode meta.Ino, chunkIndex uint32) bool {
++	s.RLock()
++	key := sparseStageKey{Inode: inode, Chunk: chunkIndex}
++	if s.active[key] != nil || len(s.pending[key]) > 0 {
++		return true
++	}
++	s.RUnlock()
++	return false
++}
++
++func (s *sparseStaging) endRead() {
++	s.RUnlock()
++}
++
++func (s *sparseStaging) Length(inode meta.Ino) uint64 {
++	s.RLock()
++	defer s.RUnlock()
++	var length uint64
++	for key, gens := range s.pending {
++		if key.Inode == inode {
++			for _, g := range gens {
++				length = max(length, g.RealEOF)
++			}
++		}
++	}
++	for key, g := range s.active {
++		if key.Inode == inode {
++			length = max(length, g.RealEOF)
++		}
++	}
++	return length
++}
++
++func (s *sparseStaging) hasGeneration(id uint64) bool {
++	_, ok := s.localIDs.Load(id)
++	return ok
++}
++
++func (s *sparseStaging) removeGenerationLocked(g *sparseGeneration) {
++	key := sparseStageKey{Inode: g.Inode, Chunk: g.Chunk}
++	if s.active[key] == g {
++		delete(s.active, key)
++	}
++	if list := s.pending[key]; len(list) > 0 {
++		for i, candidate := range list {
++			if candidate == g {
++				list = append(list[:i], list[i+1:]...)
++				break
++			}
++		}
++		if len(list) == 0 {
++			delete(s.pending, key)
++		} else {
++			s.pending[key] = list
++		}
++	}
++	delete(s.byID, g.ID)
++	s.localIDs.Delete(g.ID)
++}
++
++func (s *sparseStaging) removeByID(id uint64) error {
++	s.publishMu.Lock()
++	defer s.publishMu.Unlock()
++	s.Lock()
++	g := s.byID[id]
++	if g == nil {
++		s.Unlock()
++		return nil
++	}
++	if err := os.Remove(g.DataPath); err != nil && !os.IsNotExist(err) {
++		s.Unlock()
++		return fmt.Errorf("remove sparse staging %s: %w", g.DataPath, err)
++	}
++	s.removeGenerationLocked(g)
++	s.Unlock()
++	return nil
++}
++
++func marshalSparseStageHeader(g *sparseGeneration, sequence uint64) []byte {
++	buf := make([]byte, sparseStageSlotSize)
++	copy(buf, sparseStageMagic[:])
++	binary.LittleEndian.PutUint16(buf[8:], sparseStageHeaderVersion)
++	if g.Frozen {
++		binary.LittleEndian.PutUint16(buf[10:], 1)
++	}
++	binary.LittleEndian.PutUint64(buf[16:], sequence)
++	binary.LittleEndian.PutUint64(buf[24:], uint64(g.Inode))
++	binary.LittleEndian.PutUint32(buf[32:], g.Chunk)
++	binary.LittleEndian.PutUint32(buf[36:], g.LogicalSize)
++	binary.LittleEndian.PutUint64(buf[40:], g.ID)
++	binary.LittleEndian.PutUint64(buf[48:], g.BaseEOF)
++	binary.LittleEndian.PutUint64(buf[56:], g.RealEOF)
++	binary.LittleEndian.PutUint64(buf[64:], uint64(g.Mtime))
++	copy(buf[72:], g.DataBitmap)
++	copy(buf[72+chunk.SparseBitmapSize:], g.ZeroBitmap)
++	binary.LittleEndian.PutUint32(buf[sparseStageSlotSize-4:], crc32.ChecksumIEEE(buf[:sparseStageSlotSize-4]))
++	return buf
++}
++
++func unmarshalSparseStageHeader(buf []byte) (*sparseGeneration, error) {
++	if len(buf) != sparseStageSlotSize || string(buf[:8]) != string(sparseStageMagic[:]) ||
++		binary.LittleEndian.Uint16(buf[8:]) != sparseStageHeaderVersion {
++		return nil, errors.New("invalid sparse stage header")
++	}
++	expected := binary.LittleEndian.Uint32(buf[sparseStageSlotSize-4:])
++	if crc32.ChecksumIEEE(buf[:sparseStageSlotSize-4]) != expected {
++		return nil, errors.New("invalid sparse stage header checksum")
++	}
++	g := &sparseGeneration{
++		Version:     1,
++		Frozen:      binary.LittleEndian.Uint16(buf[10:])&1 != 0,
++		Sequence:    binary.LittleEndian.Uint64(buf[16:]),
++		Inode:       meta.Ino(binary.LittleEndian.Uint64(buf[24:])),
++		Chunk:       binary.LittleEndian.Uint32(buf[32:]),
++		LogicalSize: binary.LittleEndian.Uint32(buf[36:]),
++		ID:          binary.LittleEndian.Uint64(buf[40:]),
++		BaseEOF:     binary.LittleEndian.Uint64(buf[48:]),
++		RealEOF:     binary.LittleEndian.Uint64(buf[56:]),
++		Mtime:       int64(binary.LittleEndian.Uint64(buf[64:])),
++		DataBitmap:  append([]byte(nil), buf[72:72+chunk.SparseBitmapSize]...),
++		ZeroBitmap:  append([]byte(nil), buf[72+chunk.SparseBitmapSize:72+2*chunk.SparseBitmapSize]...),
++	}
++	if g.Sequence == 0 || !meta.IsSparseSliceID(g.ID) || g.LogicalSize == 0 || g.LogicalSize > meta.ChunkSize {
++		return nil, errors.New("invalid sparse stage generation")
++	}
++	return g, nil
++}
++
++func (s *sparseStaging) syncGeneration(g *sparseGeneration) error {
++	f, err := os.OpenFile(g.DataPath, os.O_RDWR, 0)
++	if err != nil {
++		return err
++	}
++	if err = f.Sync(); err != nil {
++		_ = f.Close()
++		return err
++	}
++	sequence := g.Sequence + 1
++	header := marshalSparseStageHeader(g, sequence)
++	slot := sequence % 2
++	if _, err = f.WriteAt(header, int64(slot*sparseStageSlotSize)); err == nil {
++		err = f.Sync()
++	}
++	_ = f.Close()
++	if err != nil {
++		return err
++	}
++	g.Sequence = sequence
++	dir, err := os.Open(s.root)
++	if err != nil {
++		return err
++	}
++	err = dir.Sync()
++	_ = dir.Close()
++	return err
++}
++
++func (s *sparseStaging) registerGeneration(g *sparseGeneration) error {
++	value := meta.Slice{Id: g.ID, Size: meta.ChunkSize, Len: meta.ChunkSize}
++	if st := s.meta.WriteEOF(meta.Background(), g.Inode, g.Chunk, 0, value, time.Unix(0, g.Mtime), g.RealEOF); st != 0 {
++		return st
++	}
++	return nil
++}
++
++func (s *sparseStaging) syncAndRegisterGeneration(g *sparseGeneration) error {
++	if err := s.syncGeneration(g); err != nil {
++		return err
++	}
++	return s.registerGeneration(g)
++}
++
++func sortSparseGenerations(gens []*sparseGeneration) {
++	sort.Slice(gens, func(i, j int) bool {
++		if gens[i].Inode != gens[j].Inode {
++			return gens[i].Inode < gens[j].Inode
++		}
++		if gens[i].Mtime != gens[j].Mtime {
++			return gens[i].Mtime < gens[j].Mtime
++		}
++		return gens[i].ID < gens[j].ID
++	})
++}
++
++func (s *sparseStaging) SyncInode(inode meta.Ino) error {
++	s.Lock()
++	defer s.Unlock()
++	var gens []*sparseGeneration
++	for key, g := range s.active {
++		if key.Inode == inode {
++			gens = append(gens, g)
++		}
++	}
++	for key, pending := range s.pending {
++		if key.Inode == inode {
++			gens = append(gens, pending...)
++		}
++	}
++	sortSparseGenerations(gens)
++	for _, g := range gens {
++		if err := s.syncAndRegisterGeneration(g); err != nil {
++			return err
++		}
++	}
++	return nil
++}
++
++func (s *sparseStaging) SyncAll() error {
++	s.Lock()
++	defer s.Unlock()
++	gens := make([]*sparseGeneration, 0, len(s.byID))
++	for _, g := range s.active {
++		gens = append(gens, g)
++	}
++	for _, pending := range s.pending {
++		gens = append(gens, pending...)
++	}
++	sortSparseGenerations(gens)
++	for _, g := range gens {
++		if err := s.syncAndRegisterGeneration(g); err != nil {
++			return err
++		}
++	}
++	return nil
++}
++
++func (s *sparseStaging) freezeLocked(filter map[meta.Ino]struct{}) error {
++	var gens []*sparseGeneration
++	for key, g := range s.active {
++		if filter != nil {
++			if _, ok := filter[key.Inode]; !ok {
++				continue
++			}
++		}
++		gens = append(gens, g)
++	}
++	sortSparseGenerations(gens)
++	for _, g := range gens {
++		key := sparseStageKey{Inode: g.Inode, Chunk: g.Chunk}
++		g.Frozen = true
++		if err := s.syncAndRegisterGeneration(g); err != nil {
++			return err
++		}
++		s.pending[key] = append(s.pending[key], g)
++		delete(s.active, key)
++	}
++	return nil
++}
++
++func (s *sparseStaging) publish(filter map[meta.Ino]struct{}) (int, error) {
++	s.publishMu.Lock()
++	defer s.publishMu.Unlock()
++	s.Lock()
++	if err := s.freezeLocked(filter); err != nil {
++		s.Unlock()
++		return 0, err
++	}
++	var gens []*sparseGeneration
++	for key, pending := range s.pending {
++		if filter != nil {
++			if _, ok := filter[key.Inode]; !ok {
++				continue
++			}
++		}
++		gens = append(gens, pending...)
++	}
++	s.Unlock()
++	sort.Slice(gens, func(i, j int) bool { return gens[i].ID < gens[j].ID })
++
++	for _, g := range gens {
++		f, err := os.Open(g.DataPath)
++		if err != nil {
++			return 0, err
++		}
++		readPage := func(page int, data []byte) error {
++			_, err := f.ReadAt(data, int64(sparseStageDataOffset+page*chunk.SparsePageSize))
++			return err
++		}
++		physicalSize, err := s.store.UploadSparse(meta.Background(), g.ID, g.LogicalSize,
++			g.DataBitmap, g.ZeroBitmap, readPage)
++		_ = f.Close()
++		if err != nil {
++			return 0, err
++		}
++		if physicalSize <= 0 || physicalSize > int64(^uint32(0)) {
++			return 0, fmt.Errorf("invalid sparse physical size %d", physicalSize)
++		}
++	}
++
++	published := 0
++	for _, g := range gens {
++		s.reader.Invalidate(g.Inode, uint64(g.Chunk)*meta.ChunkSize, uint64(g.LogicalSize))
++		s.Lock()
++		key := sparseStageKey{Inode: g.Inode, Chunk: g.Chunk}
++		list := s.pending[key]
++		for i, candidate := range list {
++			if candidate == g {
++				s.pending[key] = append(list[:i], list[i+1:]...)
++				break
++			}
++		}
++		if len(s.pending[key]) == 0 {
++			delete(s.pending, key)
++		}
++		delete(s.byID, g.ID)
++		s.localIDs.Delete(g.ID)
++		s.Unlock()
++		_ = os.Remove(g.DataPath)
++		published++
++	}
++	return published, nil
++}
++
++func (s *sparseStaging) PublishAll() (int, error) {
++	return s.publish(nil)
++}
++
++func (s *sparseStaging) PublishInodes(inodes []meta.Ino) (int, error) {
++	filter := make(map[meta.Ino]struct{}, len(inodes))
++	for _, inode := range inodes {
++		filter[inode] = struct{}{}
++	}
++	return s.publish(filter)
++}
++
++func (s *sparseStaging) stagedBytesLocked() uint64 {
++	var pages uint64
++	count := func(g *sparseGeneration) {
++		for i := range g.DataBitmap {
++			for b := g.DataBitmap[i]; b != 0; b &= b - 1 {
++				pages++
++			}
++		}
++	}
++	for _, g := range s.active {
++		count(g)
++	}
++	for _, gens := range s.pending {
++		for _, g := range gens {
++			count(g)
++		}
++	}
++	return pages * chunk.SparsePageSize
++}
++
++func (s *sparseStaging) maybeTriggerWatermarkLocked() {
++	if s.conf.Chunk.StageUsageHigh <= 0 || s.conf.Chunk.CacheSize == 0 {
++		return
++	}
++	high := uint64(float64(s.conf.Chunk.CacheSize) * float64(s.conf.Chunk.StageUsageHigh))
++	if s.stagedBytesLocked() < high || !s.watermarkPublishing.CompareAndSwap(false, true) {
++		return
++	}
++	go func() {
++		defer s.watermarkPublishing.Store(false)
++		if _, err := s.PublishAll(); err != nil {
++			logger.Errorf("publish sparse staging at high watermark: %s", err)
++		}
++	}()
++}
++
++func (s *sparseStaging) recover() error {
++	entries, err := os.ReadDir(s.root)
++	if err != nil {
++		return err
++	}
++	for _, entry := range entries {
++		if entry.IsDir() || !strings.HasSuffix(entry.Name(), ".stage") {
++			continue
++		}
++		dataPath := filepath.Join(s.root, entry.Name())
++		f, err := os.Open(dataPath)
++		if err != nil {
++			return err
++		}
++		info, err := f.Stat()
++		if err != nil || info.Size() != sparseStageDataOffset+meta.ChunkSize {
++			_ = f.Close()
++			return fmt.Errorf("invalid sparse stage %s", dataPath)
++		}
++		var recovered *sparseGeneration
++		for slot := 0; slot < 2; slot++ {
++			buf := make([]byte, sparseStageSlotSize)
++			if _, err = f.ReadAt(buf, int64(slot*sparseStageSlotSize)); err != nil {
++				continue
++			}
++			candidate, decodeErr := unmarshalSparseStageHeader(buf)
++			if decodeErr == nil && (recovered == nil || candidate.Sequence > recovered.Sequence) {
++				recovered = candidate
++			}
++		}
++		_ = f.Close()
++		if recovered == nil {
++			_ = os.Remove(dataPath)
++			continue
++		}
++		g := recovered
++		g.DataPath = dataPath
++		key := sparseStageKey{Inode: g.Inode, Chunk: g.Chunk}
++		s.byID[g.ID] = g
++		s.localIDs.Store(g.ID, struct{}{})
++		if g.Frozen {
++			s.pending[key] = append(s.pending[key], g)
++		} else if old := s.active[key]; old == nil || old.ID < g.ID {
++			if old != nil {
++				old.Frozen = true
++				s.pending[key] = append(s.pending[key], old)
++			}
++			s.active[key] = g
++		} else {
++			g.Frozen = true
++			s.pending[key] = append(s.pending[key], g)
++		}
++	}
++	for key := range s.pending {
++		sort.Slice(s.pending[key], func(i, j int) bool { return s.pending[key][i].ID < s.pending[key][j].ID })
++	}
++	gens := make([]*sparseGeneration, 0, len(s.byID))
++	for _, g := range s.byID {
++		gens = append(gens, g)
++	}
++	sortSparseGenerations(gens)
++	for _, g := range gens {
++		if err := s.registerGeneration(g); err != nil {
++			if errors.Is(err, syscall.ENOENT) {
++				s.removeGenerationLocked(g)
++				_ = os.Remove(g.DataPath)
++				continue
++			}
++			return err
++		}
++	}
++	return nil
++}
+diff --git a/pkg/vfs/sparse_staging_test.go b/pkg/vfs/sparse_staging_test.go
+new file mode 100644
+index 0000000000000000000000000000000000000000..72093aebb6004b7d6564e9b63275feec9f9eae4d
+--- /dev/null
++++ b/pkg/vfs/sparse_staging_test.go
+@@ -0,0 +1,405 @@
++/*
++ * JuiceFS, Copyright 2026 Juicedata, Inc.
++ *
++ * Licensed under the Apache License, Version 2.0 (the "License");
++ * you may not use this file except in compliance with the License.
++ * You may obtain a copy of the License at
++ *
++ *     http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++package vfs
++
++import (
++	"bytes"
++	"context"
++	"fmt"
++	"log"
++	"os"
++	"strings"
++	"syscall"
++	"testing"
++	"time"
++
++	"github.com/google/uuid"
++	"github.com/juicedata/juicefs/pkg/chunk"
++	"github.com/juicedata/juicefs/pkg/meta"
++	"github.com/juicedata/juicefs/pkg/object"
++	"github.com/prometheus/client_golang/prometheus"
++	"github.com/stretchr/testify/require"
++)
++
++func createTestVFSSparse(t *testing.T) (*VFS, object.ObjectStorage) {
++	t.Helper()
++	mp := "/jfs"
++	metaConf := meta.DefaultConf()
++	metaConf.MountPoint = mp
++	m := meta.NewClient("memkv://", metaConf)
++	format := &meta.Format{
++		Name: "sparse-test", UUID: uuid.New().String(), Storage: "mem",
++		BlockSize: 4096, Compression: "none", DirStats: true,
++	}
++	if err := m.Init(format, true); err != nil {
++		log.Fatalf("setting: %s", err)
++	}
++	require.NoError(t, m.NewSession(true))
++	t.Cleanup(func() { _ = m.CloseSession() })
++	conf := &Config{
++		Meta: metaConf, Format: *format, Version: "Juicefs",
++		Chunk: &chunk.Config{
++			BlockSize: format.BlockSize * 1024, Compress: "none",
++			MaxUpload: 2, MaxDownload: 16, BufferSize: 64 << 20,
++			CacheSize: 128 << 20, CacheDir: t.TempDir(),
++			CacheChecksum: chunk.CsNone, CacheEviction: "2-random",
++			Writeback: true, SparseChunkSlice: true,
++			WritebackThresholdSize: format.BlockSize*1024 + 1,
++			AutoCreate:             true, PutTimeout: time.Second, GetTimeout: time.Second,
++			MaxRetries: 3,
++		},
++		FuseOpts: &FuseOptions{},
++	}
++	conf.Chunk.SelfCheck(format.UUID)
++	blob, _ := object.CreateStorage("mem", "", "", "", "")
++	registry := prometheus.NewRegistry()
++	registerer := prometheus.WrapRegistererWithPrefix("juicefs_",
++		prometheus.WrapRegistererWith(prometheus.Labels{"mp": mp, "vol_name": format.Name}, registry))
++	store := chunk.NewCachedStore(blob, *conf.Chunk, registry)
++	m.OnMsg(meta.DeleteSlice, func(args ...interface{}) error {
++		return store.Remove(args[0].(uint64), int(args[1].(uint32)))
++	})
++	return NewVFS(conf, m, store, registerer, registry), blob
++}
++
++func createSparseFile(t *testing.T, v *VFS, name string) (Context, meta.Ino, uint64) {
++	t.Helper()
++	ctx := NewLogContext(meta.NewContext(1, 1, []uint32{1}))
++	entry, fh, st := v.Create(ctx, 1, name, 0644, 0, syscall.O_RDWR)
++	require.Zero(t, st)
++	return ctx, entry.Inode, fh
++}
++
++func TestSparseVisibilityAndEOF(t *testing.T) {
++	for _, size := range []int{11, 4 << 20} {
++		t.Run(fmt.Sprintf("eof-%d", size), func(t *testing.T) {
++			v, _ := createTestVFSSparse(t)
++			ctx, inode, fh := createSparseFile(t, v, "eof")
++			data := bytes.Repeat([]byte{0x5A}, size)
++			require.Zero(t, v.Write(ctx, inode, data, 0, fh))
++			require.Zero(t, v.Fsync(ctx, inode, 0, fh))
++
++			var attr meta.Attr
++			require.Zero(t, v.Meta.GetAttr(ctx, inode, &attr))
++			require.Equal(t, uint64(size), attr.Length)
++			var slices []meta.Slice
++			require.Zero(t, v.Meta.Read(ctx, inode, 0, &slices))
++			require.Len(t, slices, 1)
++			require.True(t, meta.IsSparseSliceID(slices[0].Id))
++			require.Equal(t, uint32(meta.ChunkSize), slices[0].Size)
++			id := slices[0].Id
++
++			got := make([]byte, size)
++			n, st := v.Read(ctx, inode, got, 0, fh)
++			require.Zero(t, st)
++			require.Equal(t, size, n)
++			require.Equal(t, data, got)
++
++			resp, st := v.flushStagingPaths(ctx, nil, false)
++			require.Zero(t, st)
++			require.Equal(t, uint64(1), resp.SliceCount)
++			require.Zero(t, v.Meta.GetAttr(ctx, inode, &attr))
++			require.Equal(t, uint64(size), attr.Length)
++			require.Zero(t, v.Meta.Read(ctx, inode, 0, &slices))
++			require.Len(t, slices, 1)
++			require.Equal(t, id, slices[0].Id)
++			require.True(t, meta.IsSparseSliceID(slices[0].Id))
++			require.Equal(t, uint32(meta.ChunkSize), slices[0].Len)
++			require.Equal(t, uint64(size), attr.Length)
++		})
++	}
++}
++
++func TestSparseRepeatedFsyncReusesSlice(t *testing.T) {
++	v, _ := createTestVFSSparse(t)
++	ctx, inode, fh := createSparseFile(t, v, "repeat-fsync")
++	page := bytes.Repeat([]byte{0x5A}, chunk.SparsePageSize)
++	require.Zero(t, v.Write(ctx, inode, page, 0, fh))
++	require.Zero(t, v.Fsync(ctx, inode, 0, fh))
++	id := sparseGenerationID(t, v, ctx, inode)
++
++	off := uint64(8 * chunk.SparsePageSize)
++	require.Zero(t, v.Write(ctx, inode, page, off, fh))
++	require.Zero(t, v.Fsync(ctx, inode, 0, fh))
++	require.Equal(t, id, sparseGenerationID(t, v, ctx, inode))
++
++	var attr meta.Attr
++	require.Zero(t, v.Meta.GetAttr(ctx, inode, &attr))
++	require.Equal(t, off+chunk.SparsePageSize, attr.Length)
++	require.True(t, v.sparse.hasGeneration(id))
++}
++
++func TestSparseSyncKeepsNewestMtime(t *testing.T) {
++	v, _ := createTestVFSSparse(t)
++	ctx, inode, fh := createSparseFile(t, v, "mtime")
++	require.Zero(t, v.Write(ctx, inode, []byte("old"), meta.ChunkSize, fh))
++	require.Zero(t, v.Write(ctx, inode, []byte("new"), 0, fh))
++
++	oldTime := time.Unix(1700000000, 100)
++	newTime := oldTime.Add(time.Second)
++	v.sparse.Lock()
++	for key, g := range v.sparse.active {
++		if key.Inode != inode {
++			continue
++		}
++		if key.Chunk == 0 {
++			g.Mtime = newTime.UnixNano()
++		} else {
++			g.Mtime = oldTime.UnixNano()
++		}
++	}
++	v.sparse.Unlock()
++	require.NoError(t, v.sparse.SyncInode(inode))
++
++	var attr meta.Attr
++	require.Zero(t, v.Meta.GetAttr(ctx, inode, &attr))
++	require.Equal(t, newTime.Unix(), attr.Mtime)
++	require.Equal(t, uint32(newTime.Nanosecond()), attr.Mtimensec)
++}
++
++func TestSparseReadGuardBlocksPublishCleanup(t *testing.T) {
++	v, _ := createTestVFSSparse(t)
++	ctx, inode, fh := createSparseFile(t, v, "read-publish")
++	require.Zero(t, v.Write(ctx, inode, bytes.Repeat([]byte{7}, chunk.SparsePageSize), 0, fh))
++	require.Zero(t, v.Fsync(ctx, inode, 0, fh))
++	require.True(t, v.sparse.beginRead(inode, 0))
++
++	done := make(chan error, 1)
++	go func() {
++		_, err := v.sparse.PublishInodes([]meta.Ino{inode})
++		done <- err
++	}()
++	select {
++	case err := <-done:
++		require.Failf(t, "publish completed during guarded read", "error: %v", err)
++	case <-time.After(50 * time.Millisecond):
++	}
++	v.sparse.endRead()
++	require.NoError(t, <-done)
++}
++
++func putDenseSlice(t *testing.T, v *VFS, ctx meta.Context, inode meta.Ino, data []byte) {
++	t.Helper()
++	var id uint64
++	require.Zero(t, v.Meta.NewSlice(ctx, &id))
++	w := v.Store.NewWriter(id, 0)
++	w.SetWriteback(false)
++	_, err := w.WriteAt(data, 0)
++	require.NoError(t, err)
++	require.NoError(t, w.Finish(len(data)))
++	require.Zero(t, v.Meta.Write(ctx, inode, 0, 0,
++		meta.Slice{Id: id, Size: uint32(len(data)), Len: uint32(len(data))}, time.Now()))
++}
++
++func TestSparseRMWAndHoleFallthrough(t *testing.T) {
++	v, _ := createTestVFSSparse(t)
++	ctx, inode, fh := createSparseFile(t, v, "rmw")
++	old := bytes.Repeat([]byte{'A'}, 3*chunk.SparsePageSize)
++	putDenseSlice(t, v, ctx, inode, old)
++	_, fh, st := v.Open(ctx, inode, syscall.O_RDWR)
++	require.Zero(t, st)
++
++	require.Zero(t, v.Write(ctx, inode, []byte{'Z'}, chunk.SparsePageSize+123, fh))
++	require.Zero(t, v.Fsync(ctx, inode, 0, fh))
++	_, st = v.flushStagingPaths(ctx, nil, false)
++	require.Zero(t, st)
++
++	got := make([]byte, len(old))
++	n, st := v.Read(ctx, inode, got, 0, fh)
++	require.Zero(t, st)
++	require.Equal(t, len(got), n)
++	require.Equal(t, byte('A'), got[0], "untouched sparse hole must inherit old slice")
++	require.Equal(t, byte('A'), got[chunk.SparsePageSize+122])
++	require.Equal(t, byte('Z'), got[chunk.SparsePageSize+123])
++	require.Equal(t, byte('A'), got[chunk.SparsePageSize+124])
++	require.Equal(t, old[2*chunk.SparsePageSize:], got[2*chunk.SparsePageSize:])
++}
++
++func TestSparseOnePagePhysicalAndOneSlice(t *testing.T) {
++	v, blob := createTestVFSSparse(t)
++	ctx, inode, fh := createSparseFile(t, v, "one-page")
++	off := uint64(meta.ChunkSize - chunk.SparsePageSize)
++	page := bytes.Repeat([]byte{7}, chunk.SparsePageSize)
++	require.Zero(t, v.Write(ctx, inode, page, off, fh))
++	require.Zero(t, v.Write(ctx, inode, []byte("patch"), off+100, fh))
++	_, st := v.flushStagingPaths(ctx, nil, false)
++	require.Zero(t, st)
++
++	var slices []meta.Slice
++	require.Zero(t, v.Meta.Read(ctx, inode, 0, &slices))
++	require.Len(t, slices, 1, "all writes in a chunk must share one generation")
++
++	var payloadBytes int64
++	var manifests int
++	objects, _, _, err := blob.List(context.Background(), "chunks/", "", "", "", 100, true)
++	require.NoError(t, err)
++	for _, obj := range objects {
++		if strings.HasSuffix(obj.Key(), ".manifest") {
++			manifests++
++		} else if strings.Contains(obj.Key(), "_sparse_") {
++			payloadBytes += obj.Size()
++		}
++	}
++	require.Equal(t, 1, manifests)
++	require.Equal(t, int64(chunk.SparsePageSize), payloadBytes)
++}
++
++func TestSparseMultiChunkPublishKeepsRealEOF(t *testing.T) {
++	v, _ := createTestVFSSparse(t)
++	ctx, inode, fh := createSparseFile(t, v, "multi-chunk")
++	end := uint64(meta.ChunkSize + chunk.SparsePageSize)
++	require.Zero(t, v.Write(ctx, inode, []byte("first"), 0, fh))
++	require.Zero(t, v.Write(ctx, inode, []byte("last"), end-4, fh))
++
++	var attr meta.Attr
++	require.Zero(t, v.Meta.GetAttr(ctx, inode, &attr))
++	require.Zero(t, attr.Length, "writes without fsync remain local")
++	resp, st := v.flushStagingPaths(ctx, nil, false)
++	require.Zero(t, st)
++	require.Equal(t, uint64(2), resp.SliceCount)
++	require.Zero(t, v.Meta.GetAttr(ctx, inode, &attr))
++	require.Equal(t, end, attr.Length)
++	for indx := uint32(0); indx < 2; indx++ {
++		var slices []meta.Slice
++		require.Zero(t, v.Meta.Read(ctx, inode, indx, &slices))
++		require.Len(t, slices, 1)
++		require.Equal(t, uint32(meta.ChunkSize), slices[0].Len)
++	}
++}
++
++func TestSparseSameNodeRecoveryDoesNotPut(t *testing.T) {
++	v, blob := createTestVFSSparse(t)
++	ctx, inode, fh := createSparseFile(t, v, "recover")
++	require.Zero(t, v.Write(ctx, inode, []byte("recover-me"), 17, fh))
++	require.Zero(t, v.Fsync(ctx, inode, 0, fh))
++
++	reader2 := NewDataReader(v.Conf, v.Meta, v.Store)
++	recovered, err := newSparseStaging(v.Conf, v.Meta, v.Store, reader2)
++	require.NoError(t, err)
++	require.GreaterOrEqual(t, recovered.Length(inode), uint64(27))
++	buf := make([]byte, chunk.SparsePageSize)
++	require.NoError(t, recovered.overlay(inode, 0, 0, buf))
++	require.Equal(t, []byte("recover-me"), buf[17:27])
++
++	var attr meta.Attr
++	require.Zero(t, v.Meta.GetAttr(ctx, inode, &attr))
++	require.Equal(t, uint64(27), attr.Length)
++	objects, _, _, err := blob.List(context.Background(), "chunks/", "", "", "", 100, true)
++	require.NoError(t, err)
++	for _, obj := range objects {
++		require.False(t, strings.Contains(obj.Key(), "_sparse"), "recovery must not auto Put")
++	}
++}
++
++func TestSparseHighWatermarkPublishes(t *testing.T) {
++	v, _ := createTestVFSSparse(t)
++	v.Conf.Chunk.StageUsageHigh = 0.000001
++	ctx, inode, fh := createSparseFile(t, v, "watermark")
++	require.Zero(t, v.Write(ctx, inode, make([]byte, chunk.SparsePageSize), 0, fh))
++	time.Sleep(50 * time.Millisecond)
++	var attr meta.Attr
++	require.Zero(t, v.Meta.GetAttr(ctx, inode, &attr))
++	require.Zero(t, attr.Length, "logical zero pages must not consume the staging space watermark")
++
++	require.Zero(t, v.Write(ctx, inode, bytes.Repeat([]byte{9}, chunk.SparsePageSize), 0, fh))
++	require.Eventually(t, func() bool {
++		return v.Meta.GetAttr(ctx, inode, &attr) == 0 && attr.Length == chunk.SparsePageSize
++	}, 5*time.Second, 10*time.Millisecond)
++}
++
++func sparseGenerationID(t *testing.T, v *VFS, ctx Context, inode meta.Ino) uint64 {
++	t.Helper()
++	var slices []meta.Slice
++	require.Zero(t, v.Meta.Read(ctx, inode, 0, &slices))
++	require.Len(t, slices, 1)
++	return slices[0].Id
++}
++
++func releaseAndWait(t *testing.T, v *VFS, ctx Context, inode meta.Ino, fh uint64) {
++	t.Helper()
++	require.Zero(t, v.Meta.Close(ctx, inode))
++	v.releaseFileHandle(inode, fh)
++}
++
++func TestSparseUnlinkRemovesUnpublishedStage(t *testing.T) {
++	v, blob := createTestVFSSparse(t)
++	ctx, inode, fh := createSparseFile(t, v, "unlink")
++	require.Zero(t, v.Write(ctx, inode, bytes.Repeat([]byte{1}, chunk.SparsePageSize), 0, fh))
++	require.Zero(t, v.Fsync(ctx, inode, 0, fh))
++	id := sparseGenerationID(t, v, ctx, inode)
++	require.True(t, v.sparse.hasGeneration(id))
++
++	releaseAndWait(t, v, ctx, inode, fh)
++	require.Zero(t, v.Unlink(ctx, meta.RootInode, "unlink"))
++	require.Eventually(t, func() bool { return !v.sparse.hasGeneration(id) }, 5*time.Second, 10*time.Millisecond)
++
++	objects, _, _, err := blob.List(context.Background(), "chunks/", "", "", "", 100, true)
++	require.NoError(t, err)
++	require.Empty(t, objects)
++}
++
++func TestSparseOpenUnlinkDefersStageRemoval(t *testing.T) {
++	v, _ := createTestVFSSparse(t)
++	ctx, inode, fh := createSparseFile(t, v, "open-unlink")
++	data := bytes.Repeat([]byte{2}, chunk.SparsePageSize)
++	require.Zero(t, v.Write(ctx, inode, data, 0, fh))
++	require.Zero(t, v.Fsync(ctx, inode, 0, fh))
++	id := sparseGenerationID(t, v, ctx, inode)
++
++	_, readFH, st := v.Open(ctx, inode, syscall.O_RDONLY)
++	require.Zero(t, st)
++	releaseAndWait(t, v, ctx, inode, fh)
++	require.Zero(t, v.Unlink(ctx, meta.RootInode, "open-unlink"))
++	require.True(t, v.sparse.hasGeneration(id))
++	got := make([]byte, len(data))
++	n, st := v.Read(ctx, inode, got, 0, readFH)
++	require.Zero(t, st)
++	require.Equal(t, len(got), n)
++	require.Equal(t, data, got)
++
++	releaseAndWait(t, v, ctx, inode, readFH)
++	require.Eventually(t, func() bool { return !v.sparse.hasGeneration(id) }, 5*time.Second, 10*time.Millisecond)
++}
++
++func TestSparseHardlinkAndRenameOverwriteLifecycle(t *testing.T) {
++	v, _ := createTestVFSSparse(t)
++	ctx, first, firstFH := createSparseFile(t, v, "first")
++	require.Zero(t, v.Write(ctx, first, bytes.Repeat([]byte{3}, chunk.SparsePageSize), 0, firstFH))
++	require.Zero(t, v.Fsync(ctx, first, 0, firstFH))
++	firstID := sparseGenerationID(t, v, ctx, first)
++	releaseAndWait(t, v, ctx, first, firstFH)
++
++	_, st := v.Link(ctx, first, meta.RootInode, "first-link")
++	require.Zero(t, st)
++	require.Zero(t, v.Unlink(ctx, meta.RootInode, "first"))
++	require.True(t, v.sparse.hasGeneration(firstID))
++
++	_, victim, victimFH := createSparseFile(t, v, "victim")
++	require.Zero(t, v.Write(ctx, victim, bytes.Repeat([]byte{4}, chunk.SparsePageSize), 0, victimFH))
++	require.Zero(t, v.Fsync(ctx, victim, 0, victimFH))
++	victimID := sparseGenerationID(t, v, ctx, victim)
++	releaseAndWait(t, v, ctx, victim, victimFH)
++
++	require.Zero(t, v.Rename(ctx, meta.RootInode, "first-link", meta.RootInode, "victim", 0))
++	require.True(t, v.sparse.hasGeneration(firstID))
++	require.Eventually(t, func() bool { return !v.sparse.hasGeneration(victimID) }, 5*time.Second, 10*time.Millisecond)
++	require.Zero(t, v.Unlink(ctx, meta.RootInode, "victim"))
++	require.Eventually(t, func() bool { return !v.sparse.hasGeneration(firstID) }, 5*time.Second, 10*time.Millisecond)
++
++	_, err := os.Stat(v.sparse.path(victim, 0, victimID))
++	require.True(t, os.IsNotExist(err))
++}
+diff --git a/pkg/vfs/vfs.go b/pkg/vfs/vfs.go
+index 598d4cfcc4f501a5aa3940e5ccd2767687ae2956..b30d8954801bfbcb73bc1d9e488d095cb3b68cc0 100644
+--- a/pkg/vfs/vfs.go
++++ b/pkg/vfs/vfs.go
+@@ -603,6 +603,9 @@ func (v *VFS) marshalConf() []byte {
+ 
+ func (v *VFS) Truncate(ctx Context, ino Ino, size int64, fh uint64, attr *Attr) (err syscall.Errno) {
+ 	// defer func() { logit(ctx, "truncate (%d,%d): %s", ino, size, strerr(err)) }()
++	if v.Conf != nil && v.Conf.Chunk != nil && v.Conf.Chunk.SparseChunkSlice {
++		return syscall.ENOTSUP
++	}
+ 	if IsSpecialNode(ino) {
+ 		err = syscall.EPERM
+ 		return
+@@ -870,6 +873,9 @@ func (v *VFS) Write(ctx Context, ino Ino, buf []byte, off, fh uint64) (err sysca
+ 
+ func (v *VFS) Fallocate(ctx Context, ino Ino, mode uint8, off, size int64, fh uint64) (err syscall.Errno) {
+ 	defer func() { logit(ctx, "fallocate", err, "(%d,%d,%d,%d)", ino, mode, off, size) }()
++	if v.Conf != nil && v.Conf.Chunk != nil && v.Conf.Chunk.SparseChunkSlice {
++		return syscall.ENOTSUP
++	}
+ 	if off < 0 || size <= 0 {
+ 		err = syscall.EINVAL
+ 		return
+@@ -922,6 +928,9 @@ func (v *VFS) CopyFileRange(ctx Context, nodeIn Ino, fhIn, offIn uint64, nodeOut
+ 	defer func() {
+ 		logit(ctx, "copy_file_range", err, "(%d,%d,%d,%d,%d,%d)", nodeIn, offIn, nodeOut, offOut, size, flags)
+ 	}()
++	if v.Conf != nil && v.Conf.Chunk != nil && v.Conf.Chunk.SparseChunkSlice {
++		return 0, syscall.ENOTSUP
++	}
+ 	if IsSpecialNode(nodeIn) {
+ 		err = syscall.ENOTSUP
+ 		return
+@@ -1236,6 +1245,7 @@ type VFS struct {
+ 	reader          DataReader
+ 	writer          DataWriter
+ 	cacheFiller     *CacheFiller
++	sparse          *sparseStaging
+ 
+ 	handles   map[Ino][]*handle
+ 	handleIno map[uint64]Ino
+@@ -1265,6 +1275,9 @@ func NewVFS(conf *Config, m meta.Meta, store chunk.ChunkStore, registerer promet
+ 		nextfh:      1,
+ 		registry:    registry,
+ 	}
++	if w, ok := writer.(*dataWriter); ok {
++		v.sparse = w.sparse
++	}
+ 
+ 	n := getInternalNode(ConfigInode)
+ 	v.Conf.Format.RemoveSecret()
+diff --git a/pkg/vfs/writer.go b/pkg/vfs/writer.go
+index 4b6f99d8c48325435c4fc0835684d7c49bd3cecc..ad21dc36bd6368236bde515db8b7a114669899fb 100644
+--- a/pkg/vfs/writer.go
++++ b/pkg/vfs/writer.go
+@@ -270,6 +270,49 @@ type fileWriter struct {
+ 	commitcond *utils.Cond // wait for committed==true of dependency slice (commit)
+ }
+ 
++type sparseFileWriter struct {
++	sync.Mutex
++	w      *dataWriter
++	inode  Ino
++	length uint64
++}
++
++func (f *sparseFileWriter) Write(_ meta.Context, off uint64, data []byte) syscall.Errno {
++	f.Lock()
++	defer f.Unlock()
++	if err := f.w.sparse.Write(f.inode, off, data, f.length); err != nil {
++		logger.Errorf("stage sparse write inode %d off %d: %s", f.inode, off, err)
++		return syscall.EIO
++	}
++	f.length = max(f.length, off+uint64(len(data)))
++	f.w.reader.Truncate(f.inode, f.length)
++	return 0
++}
++
++func (f *sparseFileWriter) Flush(_ meta.Context) syscall.Errno {
++	if err := f.w.sparse.SyncInode(f.inode); err != nil {
++		logger.Errorf("sync sparse staging inode %d: %s", f.inode, err)
++		return syscall.EIO
++	}
++	return 0
++}
++
++func (f *sparseFileWriter) Close(ctx meta.Context) syscall.Errno {
++	return f.Flush(ctx)
++}
++
++func (f *sparseFileWriter) GetLength() uint64 {
++	f.Lock()
++	defer f.Unlock()
++	return max(f.length, f.w.sparse.Length(f.inode))
++}
++
++func (f *sparseFileWriter) Truncate(length uint64) {
++	f.Lock()
++	f.length = length
++	f.Unlock()
++}
++
+ // protected by file
+ func (f *fileWriter) findChunk(i uint32) *chunkWriter {
+ 	c := f.chunks[i]
+@@ -483,6 +526,7 @@ type dataWriter struct {
+ 	bufferSize int64
+ 	files      map[Ino]*fileWriter
+ 	maxRetries uint32
++	sparse     *sparseStaging
+ }
+ 
+ func NewDataWriter(conf *Config, m meta.Meta, store chunk.ChunkStore, reader DataReader) DataWriter {
+@@ -496,7 +540,15 @@ func NewDataWriter(conf *Config, m meta.Meta, store chunk.ChunkStore, reader Dat
+ 		files:      make(map[Ino]*fileWriter),
+ 		maxRetries: uint32(conf.Meta.Retries),
+ 	}
++	if conf.Chunk.SparseChunkSlice {
++		sparse, err := newSparseStaging(conf, m, store, reader)
++		if err != nil {
++			logger.Fatalf("initialize sparse staging: %s", err)
++		}
++		w.sparse = sparse
++	} else {
+ 		go w.flushAll()
++	}
+ 	return w
+ }
+ 
+@@ -531,6 +583,9 @@ func (w *dataWriter) flushAll() {
+ }
+ 
+ func (w *dataWriter) Open(inode Ino, len uint64, tierID uint8) FileWriter {
++	if w.sparse != nil {
++		return &sparseFileWriter{w: w, inode: inode, length: max(len, w.sparse.Length(inode))}
++	}
+ 	w.Lock()
+ 	defer w.Unlock()
+ 	f, ok := w.files[inode]
+@@ -567,6 +622,12 @@ func (w *dataWriter) free(f *fileWriter) {
+ }
+ 
+ func (w *dataWriter) Flush(ctx meta.Context, inode Ino) syscall.Errno {
++	if w.sparse != nil {
++		if err := w.sparse.SyncInode(inode); err != nil {
++			return syscall.EIO
++		}
++		return 0
++	}
+ 	f := w.find(inode)
+ 	if f != nil {
+ 		return f.Flush(ctx)
+@@ -575,6 +636,9 @@ func (w *dataWriter) Flush(ctx meta.Context, inode Ino) syscall.Errno {
+ }
+ 
+ func (w *dataWriter) GetLength(inode Ino) uint64 {
++	if w.sparse != nil {
++		return w.sparse.Length(inode)
++	}
+ 	f := w.find(inode)
+ 	if f != nil {
+ 		return f.GetLength()
+@@ -583,6 +647,11 @@ func (w *dataWriter) GetLength(inode Ino) uint64 {
+ }
+ 
+ func (w *dataWriter) Truncate(inode Ino, len uint64) {
++	if w.sparse != nil {
++		// Sparse truncation publication is not implemented yet; VFS currently
++		// routes truncate through the existing global metadata operation.
++		return
++	}
+ 	f := w.find(inode)
+ 	if f != nil {
+ 		f.Truncate(len)
+@@ -590,6 +659,9 @@ func (w *dataWriter) Truncate(inode Ino, len uint64) {
+ }
+ 
+ func (w *dataWriter) UpdateMtime(inode Ino, mtime time.Time) {
++	if w.sparse != nil {
++		return
++	}
+ 	f := w.find(inode)
+ 	if f != nil {
+ 		f.updateMtime(mtime)
+@@ -597,6 +669,9 @@ func (w *dataWriter) UpdateMtime(inode Ino, mtime time.Time) {
+ }
+ 
+ func (w *dataWriter) FlushAll() error {
++	if w.sparse != nil {
++		return w.sparse.SyncAll()
++	}
+ 	var err error
+ 	w.Lock()
+ 	for inode, ind := range w.files {
