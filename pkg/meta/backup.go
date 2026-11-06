@@ -669,12 +669,12 @@ func (c *DumpedCounters) updateFromSegment(seg *BakSegment, counters *[]*pb.Coun
 		for _, chunk := range seg.val.(*pb.Batch).Chunks {
 			recordInode(chunk.Inode)
 			for _, s := range readSliceBuf(chunk.Slices) {
-				c.NextChunk = max(c.NextChunk, int64(s.id)+1)
+				c.NextChunk = max(c.NextChunk, int64(s.id&^SparseSliceBit)+1)
 			}
 		}
 	case segTypeSliceRef:
 		for _, ref := range seg.val.(*pb.Batch).SliceRefs {
-			c.NextChunk = max(c.NextChunk, int64(ref.Id)+1)
+			c.NextChunk = max(c.NextChunk, int64(ref.Id&^SparseSliceBit)+1)
 		}
 	case segTypeSustained:
 		for _, sustained := range seg.val.(*pb.Batch).Sustained {

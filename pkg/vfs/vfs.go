@@ -603,6 +603,9 @@ func (v *VFS) marshalConf() []byte {
 
 func (v *VFS) Truncate(ctx Context, ino Ino, size int64, fh uint64, attr *Attr) (err syscall.Errno) {
 	// defer func() { logit(ctx, "truncate (%d,%d): %s", ino, size, strerr(err)) }()
+	if v.Conf != nil && v.Conf.Chunk != nil && v.Conf.Chunk.SparseChunkSlice {
+		return syscall.ENOTSUP
+	}
 	if IsSpecialNode(ino) {
 		err = syscall.EPERM
 		return
@@ -870,6 +873,9 @@ func (v *VFS) Write(ctx Context, ino Ino, buf []byte, off, fh uint64) (err sysca
 
 func (v *VFS) Fallocate(ctx Context, ino Ino, mode uint8, off, size int64, fh uint64) (err syscall.Errno) {
 	defer func() { logit(ctx, "fallocate", err, "(%d,%d,%d,%d)", ino, mode, off, size) }()
+	if v.Conf != nil && v.Conf.Chunk != nil && v.Conf.Chunk.SparseChunkSlice {
+		return syscall.ENOTSUP
+	}
 	if off < 0 || size <= 0 {
 		err = syscall.EINVAL
 		return
@@ -922,6 +928,9 @@ func (v *VFS) CopyFileRange(ctx Context, nodeIn Ino, fhIn, offIn uint64, nodeOut
 	defer func() {
 		logit(ctx, "copy_file_range", err, "(%d,%d,%d,%d,%d,%d)", nodeIn, offIn, nodeOut, offOut, size, flags)
 	}()
+	if v.Conf != nil && v.Conf.Chunk != nil && v.Conf.Chunk.SparseChunkSlice {
+		return 0, syscall.ENOTSUP
+	}
 	if IsSpecialNode(nodeIn) {
 		err = syscall.ENOTSUP
 		return
@@ -1236,6 +1245,7 @@ type VFS struct {
 	reader          DataReader
 	writer          DataWriter
 	cacheFiller     *CacheFiller
+	sparse          *sparseStaging
 
 	handles   map[Ino][]*handle
 	handleIno map[uint64]Ino
@@ -1264,6 +1274,9 @@ func NewVFS(conf *Config, m meta.Meta, store chunk.ChunkStore, registerer promet
 		modifiedAt:  make(map[meta.Ino]time.Time),
 		nextfh:      1,
 		registry:    registry,
+	}
+	if w, ok := writer.(*dataWriter); ok {
+		v.sparse = w.sparse
 	}
 
 	n := getInternalNode(ConfigInode)

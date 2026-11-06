@@ -3209,7 +3209,7 @@ func (m *redisMeta) doWrite(ctx Context, inode Ino, indx uint32, off uint32, sli
 		if attr.Typ != TypeFile {
 			return syscall.EPERM
 		}
-		newleng := uint64(indx)*ChunkSize + uint64(off) + uint64(slice.Len)
+		newleng := sliceCommitLength(ctx, indx, off, slice)
 		if newleng > attr.Length {
 			delta.length = int64(newleng - attr.Length)
 			delta.space = align4K(newleng) - align4K(attr.Length)
@@ -3224,23 +3224,40 @@ func (m *redisMeta) doWrite(ctx Context, inode Ino, indx uint32, off uint32, sli
 		attr.Ctime = now.Unix()
 		attr.Ctimensec = uint32(now.Nanosecond())
 
+		duplicateSparse := false
+		if IsSparseSliceID(slice.Id) {
+			vals, listErr := tx.LRange(ctx, m.chunkKey(inode, indx), 0, -1).Result()
+			if listErr != nil {
+				return listErr
+			}
+			if existing := findSliceByID(readSlices(vals), slice.Id); existing != nil {
+				if !sameSliceRecord(existing, off, slice) {
+					return syscall.EINVAL
+				}
+				duplicateSparse = true
+				*numSlices = len(vals)
+			}
+		}
 		var rpush *redis.IntCmd
 		_, err = tx.TxPipelined(ctx, func(pipe redis.Pipeliner) error {
-			rpush = pipe.RPush(ctx, m.chunkKey(inode, indx), marshalSlice(off, slice.Id, slice.Size, slice.Off, slice.Len))
+			if !duplicateSparse {
+				rpush = pipe.RPush(ctx, m.chunkKey(inode, indx), marshalSlice(off, slice.Id, slice.Size, slice.Off, slice.Len))
+			}
 			// most of chunk are used by single inode, so use that as the default (1 == not exists)
 			// pipe.Incr(ctx, r.sliceKey(slice.ID, slice.Size))
 			pipe.Set(ctx, m.inodeKey(inode), m.marshal(attr), 0)
 			if delta.space > 0 {
 				pipe.IncrBy(ctx, m.usedSpaceKey(), delta.space)
 			}
-			m.genLog(ctx, pipe, now, "WRITE(%d,%d,%d,%d,%d,%d,%d):%d", inode, indx, off, slice.Id, slice.Len, attr.Mtime, attr.Mtimensec, *numSlices)
+			format, args := writeLogArgs(ctx, inode, indx, off, slice, attr.Mtime, attr.Mtimensec, *numSlices)
+			m.genLog(ctx, pipe, now, format, args...)
 			return nil
 		})
-		if err == nil {
+		if err == nil && rpush != nil {
 			*numSlices = int(rpush.Val())
 		}
 		return err
-	}, m.inodeKey(inode)))
+	}, m.inodeKey(inode), m.chunkKey(inode, indx)))
 }
 
 func (m *redisMeta) CopyFileRange(ctx Context, fin Ino, offIn uint64, fout Ino, offOut uint64, size uint64, flags uint32, copied, outLength *uint64) syscall.Errno {

@@ -131,6 +131,40 @@ func readSliceBuf(buf []byte) []*slice {
 	return ss
 }
 
+func findSliceByID(ss []*slice, id uint64) *slice {
+	for _, s := range ss {
+		if s.id == id {
+			return s
+		}
+	}
+	return nil
+}
+
+func sameSliceRecord(s *slice, pos uint32, value Slice) bool {
+	return s != nil && s.pos == pos && s.id == value.Id && s.size == value.Size &&
+		s.off == value.Off && s.len == value.Len
+}
+
+func sliceCommitLength(ctx Context, indx, off uint32, slice Slice) uint64 {
+	if length, ok := fileLengthFrom(ctx); ok {
+		return length
+	}
+	return uint64(indx)*ChunkSize + uint64(off) + uint64(slice.Len)
+}
+
+func writeLogArgs(ctx Context, inode Ino, indx, off uint32, slice Slice, mtime int64, mtimensec uint32, numSlices int) (string, []any) {
+	implied := uint64(indx)*ChunkSize + uint64(off) + uint64(slice.Len)
+	args := []any{inode, indx, off, slice.Id, slice.Len, mtime, mtimensec}
+	format := "WRITE(%d,%d,%d,%d,%d,%d,%d"
+	if length, ok := fileLengthFrom(ctx); ok && length != implied {
+		format += ",%d"
+		args = append(args, length)
+	}
+	format += "):%d"
+	args = append(args, numSlices)
+	return format, args
+}
+
 func buildSlice(ss []*slice) []Slice {
 	var root *slice
 	for i := range ss {
@@ -151,6 +185,29 @@ func buildSlice(ss []*slice) []Slice {
 		chunk = append(chunk, Slice{Id: s.id, Size: s.size, Off: s.off, Len: s.len})
 		pos += s.len
 	})
+	return chunk
+}
+
+func hasSparseSlice(ss []*slice) bool {
+	for _, s := range ss {
+		if IsSparseSliceID(s.id) {
+			return true
+		}
+	}
+	return false
+}
+
+// buildOverlaySlices preserves persisted write order and positions when a
+// sparse slice is present. Sparse readers need older overlapping records so an
+// unmaterialized page can inherit from the previous generation.
+func buildOverlaySlices(ss []*slice) []OverlaySlice {
+	chunk := make([]OverlaySlice, 0, len(ss))
+	for _, s := range ss {
+		chunk = append(chunk, OverlaySlice{
+			Slice: Slice{Id: s.id, Size: s.size, Off: s.off, Len: s.len},
+			Pos:   s.pos,
+		})
+	}
 	return chunk
 }
 

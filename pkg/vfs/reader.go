@@ -172,8 +172,17 @@ func (s *sliceReader) run() {
 	inode := f.inode
 	f.Unlock()
 
-	var slices []meta.Slice
-	err := f.r.m.Read(meta.Background(), inode, indx, &slices)
+	var (
+		slices      []meta.Slice
+		overlays    []meta.OverlaySlice
+		overlayRead bool
+		err         syscall.Errno
+	)
+	if hybridReader, ok := f.r.m.(meta.HybridReader); ok {
+		overlayRead, err = hybridReader.ReadHybrid(meta.Background(), inode, indx, &slices, &overlays)
+	} else {
+		err = f.r.m.Read(meta.Background(), inode, indx, &slices)
+	}
 	f.Lock()
 	length := f.length
 	if s.state != BUSY || f.shouldStop() {
@@ -215,8 +224,28 @@ func (s *sliceReader) run() {
 	defer p.Release()
 	var n int
 
+	localRead := f.r.sparse != nil && f.r.sparse.beginRead(inode, indx)
 	ctx := context.WithValue(s.ctx, meta.CtxKey("inode"), inode) // Output inode in log for debugging
-	n = f.r.Read(ctx, p, slices, (uint32(s.block.off))%meta.ChunkSize)
+	if overlayRead {
+		n = f.r.readOverlaySlices(ctx, p, overlays, uint32(s.block.off)%meta.ChunkSize)
+	} else {
+		n = f.r.Read(ctx, p, slices, (uint32(s.block.off))%meta.ChunkSize)
+	}
+	if n == int(need) && f.r.sparse != nil {
+		var overlayErr error
+		if localRead {
+			overlayErr = f.r.sparse.overlayLocked(inode, indx, uint32(s.block.off)%meta.ChunkSize, p.Data)
+		} else {
+			overlayErr = f.r.sparse.overlay(inode, indx, uint32(s.block.off)%meta.ChunkSize, p.Data)
+		}
+		if overlayErr != nil {
+			logger.Errorf("read local sparse staging inode %d chunk %d: %s", inode, indx, overlayErr)
+			n = 0
+		}
+	}
+	if localRead {
+		f.r.sparse.endRead()
+	}
 
 	f.Lock()
 	if s.state != BUSY || f.shouldStop() {
@@ -713,6 +742,7 @@ type dataReader struct {
 	sync.Mutex
 	m              meta.Meta
 	store          chunk.ChunkStore
+	sparse         *sparseStaging
 	files          map[Ino]*fileReader
 	blockSize      uint64
 	bufferSize     int64
@@ -892,6 +922,104 @@ func (r *dataReader) Read(ctx context.Context, page *chunk.Page, slices []meta.S
 		return 0
 	}
 	return read
+}
+
+func (r *dataReader) readOverlaySlices(ctx context.Context, page *chunk.Page, slices []meta.OverlaySlice, offset uint32) int {
+	buf := page.Data
+	end := uint64(offset) + uint64(len(buf))
+	sparseStore, sparseOK := r.store.(chunk.SparseChunkStore)
+	if len(slices) == 1 && sparseOK && meta.IsSparseSliceID(slices[0].Id) {
+		s := &slices[0]
+		if r.sparse != nil && r.sparse.hasGeneration(s.Id) {
+			clear(buf)
+			return len(buf)
+		}
+		start := uint64(offset)
+		stop := end
+		sliceStart := uint64(s.Pos)
+		sliceEnd := sliceStart + uint64(s.Len)
+		if start >= sliceStart && stop <= sliceEnd &&
+			start%chunk.SparsePageSize == 0 && stop%chunk.SparsePageSize == 0 {
+			firstPage := int(start) / chunk.SparsePageSize
+			states := make([]chunk.SparsePageState, len(buf)/chunk.SparsePageSize)
+			if err := sparseStore.ReadSparsePages(ctx, s.Id, firstPage, states, buf); err != nil {
+				logger.Errorf("read sparse slice %d pages from %d: %s", s.Id, firstPage, err)
+				return 0
+			}
+			for i, state := range states {
+				if state == chunk.SparsePageInherit {
+					clear(buf[i*chunk.SparsePageSize : (i+1)*chunk.SparsePageSize])
+				}
+			}
+			return len(buf)
+		}
+	}
+	clear(buf)
+	for i := range slices {
+		s := &slices[i]
+		sliceStart := uint64(s.Pos)
+		sliceEnd := sliceStart + uint64(s.Len)
+		start := max(uint64(offset), sliceStart)
+		stop := min(end, sliceEnd)
+		if start >= stop {
+			continue
+		}
+		dstStart := int(start - uint64(offset))
+		dstEnd := int(stop - uint64(offset))
+		if s.Id == 0 {
+			clear(buf[dstStart:dstEnd])
+			continue
+		}
+		if !meta.IsSparseSliceID(s.Id) {
+			p := chunk.NewPage(buf[dstStart:dstEnd])
+			err := r.readSlice(ctx, &s.Slice, p, int(start-sliceStart))
+			p.Release()
+			if err != nil {
+				return 0
+			}
+			continue
+		}
+		if r.sparse != nil && r.sparse.hasGeneration(s.Id) {
+			continue
+		}
+		if !sparseOK {
+			logger.Errorf("sparse slice %d requires sparse-capable chunk store", s.Id)
+			return 0
+		}
+		firstPage := int(start) / chunk.SparsePageSize
+		lastPage := int(stop-1) / chunk.SparsePageSize
+		pageStates := make([]chunk.SparsePageState, lastPage-firstPage+1)
+		if start%chunk.SparsePageSize == 0 && stop%chunk.SparsePageSize == 0 {
+			if err := sparseStore.ReadSparsePages(ctx, s.Id, firstPage, pageStates, buf[dstStart:dstEnd]); err != nil {
+				logger.Errorf("read sparse slice %d pages %d-%d: %s", s.Id, firstPage, lastPage, err)
+				return 0
+			}
+			continue
+		}
+		pageBuf := make([]byte, len(pageStates)*chunk.SparsePageSize)
+		if err := sparseStore.ReadSparsePages(ctx, s.Id, firstPage, pageStates, pageBuf); err != nil {
+			logger.Errorf("read sparse slice %d pages %d-%d: %s", s.Id, firstPage, lastPage, err)
+			return 0
+		}
+		for pageIndex := firstPage; pageIndex <= lastPage; pageIndex++ {
+			state := pageStates[pageIndex-firstPage]
+			if state == chunk.SparsePageInherit {
+				continue
+			}
+			pageStart := uint64(pageIndex * chunk.SparsePageSize)
+			copyStart := max(start, pageStart)
+			copyEnd := min(stop, pageStart+chunk.SparsePageSize)
+			d0 := int(copyStart - uint64(offset))
+			d1 := int(copyEnd - uint64(offset))
+			if state == chunk.SparsePageZero {
+				clear(buf[d0:d1])
+			} else {
+				pageOffset := uint64((pageIndex - firstPage) * chunk.SparsePageSize)
+				copy(buf[d0:d1], pageBuf[pageOffset+copyStart-pageStart:pageOffset+copyEnd-pageStart])
+			}
+		}
+	}
+	return len(buf)
 }
 
 func (r *dataReader) readManySlices(ctx context.Context, page *chunk.Page, slices []meta.Slice, offset uint32) int {

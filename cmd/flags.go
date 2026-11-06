@@ -251,6 +251,15 @@ func dataCacheFlags() []cli.Flag {
 			Value: 0.1,
 			Usage: "min free space (ratio)",
 		},
+		&cli.Float64Flag{
+			Name:  "stage-usage-high-ratio",
+			Value: 0.8,
+			Usage: "publish sparse staging when staged data / cache capacity reaches this ratio (0 disables)",
+		},
+		&cli.BoolFlag{
+			Name:  "sparse-chunk-slice",
+			Usage: "stage one sparse 64 MiB generation per inode/chunk (requires writeback)",
+		},
 		&cli.BoolFlag{
 			Name:  "cache-partial-only",
 			Usage: "cache only random/small read",

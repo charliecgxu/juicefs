@@ -243,6 +243,12 @@ func (e *ChangeEntry) Validate() error {
 		}
 		return nil
 	}
+	if e.Op == OpWrite {
+		if len(e.Result) != 1 || (len(e.Args) != 7 && len(e.Args) != 8) {
+			return fmt.Errorf("%s: expect 7 or 8 arguments and 1 result, got (args=%d, results=%d)", e.Op, len(e.Args), len(e.Result))
+		}
+		return nil
+	}
 	if e.Op == OpCloneBatch {
 		// parent, mode, umask, uid, gids, (srcInode, name)... : dstInode...
 		if len(e.Args) < 7 || (len(e.Args)-5)%2 != 0 {

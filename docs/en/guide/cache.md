@@ -198,6 +198,14 @@ Add `--writeback` to the mount command to enable client write cache, but this mo
 
 Improper usage of client write cache can easily cause problems, that's why only recommend to temporarily enable this when writing large number of small files (e.g. extracting a compressed file containing a large number of small files).
 
+#### Experimental sparse controlled staging
+
+`--sparse-chunk-slice` is an experimental, opt-in extension of `--writeback`. Random writes overwrite one sparse local 64 MiB generation per file chunk. The first `fsync`, `flush`, or close checkpoints it locally and registers one stable metadata slice; later syncs idempotently reuse that record instead of appending slices. `juicefs flush-staging` only uploads the packed payload and manifest. A staging high watermark can also trigger upload.
+
+Before the first sparse mount, irreversibly upgrade the volume format with `juicefs config META-URL --enable-sparse-chunk`. This raises the metadata format version so that community clients without packed-sparse support reject the volume instead of misreading it. Until Put completes, the registered sparse slice has no remote manifest and must not be read from another client. This mode is therefore limited to workloads that enforce a single writer and control cross-client read timing.
+
+Truncate, fallocate, and copy-file-range are rejected. Sparse compaction and `juicefs gc` object accounting are not implemented yet, and sparse payloads currently bypass normal block compression, upload throttling, and tier selection.
+
 When `--writeback` is enabled, apart from checking `/var/jfsCache/<UUID>/rawstaging/` directly, you can also view upload progress using:
 
 ```shell

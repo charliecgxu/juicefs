@@ -2763,7 +2763,7 @@ func (m *kvMeta) doWrite(ctx Context, inode Ino, indx uint32, off uint32, slice 
 			logger.Errorf("Invalid chunk value for inode %d indx %d: %d", inode, indx, len(rs[1]))
 			return syscall.EIO
 		}
-		newleng := uint64(indx)*ChunkSize + uint64(off) + uint64(slice.Len)
+		newleng := sliceCommitLength(ctx, indx, off, slice)
 		if newleng > attr.Length {
 			delta.length = int64(newleng - attr.Length)
 			delta.space = align4K(newleng) - align4K(attr.Length)
@@ -2778,17 +2778,31 @@ func (m *kvMeta) doWrite(ctx Context, inode Ino, indx uint32, off uint32, slice 
 		attr.Ctime = now.Unix()
 		attr.Ctimensec = uint32(now.Nanosecond())
 		val := marshalSlice(off, slice.Id, slice.Size, slice.Off, slice.Len)
+		duplicateSparse := false
 		for i := 0; i < len(rs[1]); i += sliceBytes {
+			existing := readSliceBuf(rs[1][i : i+sliceBytes])[0]
+			if IsSparseSliceID(slice.Id) && existing.id == slice.Id {
+				if !sameSliceRecord(existing, off, slice) {
+					return syscall.EINVAL
+				}
+				duplicateSparse = true
+				break
+			}
 			if bytes.Equal(rs[1][i:i+sliceBytes], val) {
 				logger.Warnf("Write same slice for inode %d indx %d sliceId %d", inode, indx, slice.Id)
 				return nil
 			}
 		}
-		val = append(rs[1], val...)
+		if duplicateSparse {
+			val = rs[1]
+		} else {
+			val = append(rs[1], val...)
+			tx.set(m.chunkKey(inode, indx), val)
+		}
 		tx.set(m.inodeKey(inode), m.marshal(attr))
-		tx.set(m.chunkKey(inode, indx), val)
 		*numSlices = len(val) / sliceBytes
-		m.genLog(tx, now, "WRITE(%d,%d,%d,%d,%d,%d,%d):%d", inode, indx, off, slice.Id, slice.Len, attr.Mtime, attr.Mtimensec, *numSlices)
+		format, args := writeLogArgs(ctx, inode, indx, off, slice, attr.Mtime, attr.Mtimensec, *numSlices)
+		m.genLog(tx, now, format, args...)
 		return nil
 	}, inode))
 }

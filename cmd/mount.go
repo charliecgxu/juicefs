@@ -369,6 +369,9 @@ func getMetaConf(c *cli.Context, mp string, readOnly bool) *meta.Config {
 }
 
 func getChunkConf(c *cli.Context, format *meta.Format) *chunk.Config {
+	if c.Bool("sparse-chunk-slice") && format.Name != "" && format.MetaVersion < meta.SparseFormatVersion {
+		logger.Fatalf("sparse-chunk-slice requires metadata format %d; run `juicefs config META-URL --enable-sparse-chunk` first", meta.SparseFormatVersion)
+	}
 	cm, err := strconv.ParseUint(c.String("cache-mode"), 8, 32)
 	if err != nil {
 		logger.Warnf("Invalid cache-mode %q, using default value 0600", c.String("cache-mode"))
@@ -398,6 +401,8 @@ func getChunkConf(c *cli.Context, format *meta.Format) *chunk.Config {
 		CacheSize:         utils.ParseBytes(c, "cache-size", 'M'),
 		CacheItems:        c.Int64("cache-items"),
 		FreeSpace:         float32(c.Float64("free-space-ratio")),
+		StageUsageHigh:    float32(c.Float64("stage-usage-high-ratio")),
+		SparseChunkSlice:  c.Bool("sparse-chunk-slice"),
 		CacheMode:         os.FileMode(cm),
 		CacheFullBlock:    !c.Bool("cache-partial-only"),
 		CacheLargeWrite:   c.Bool("cache-large-write"),

@@ -362,15 +362,15 @@ func (r *Replayer) Replay(ctx Context, e *ChangeEntry) error {
 			return r.setQuota(ctx, e)
 		case OpDelQuota:
 			return r.delQuota(ctx, e)
-    case OpDirStat:
-      // FIXME: backup/load must restore an accurate directory-stat baseline.
-      // FIXME: coordinate pending and in-flight dir-stat updates with this resync to avoid double-counting.
-      inode, err := e.Ino(0)
-      if err != nil {
-        return err
-      }
-      _, st := dst.en.doSyncDirStat(ctx, inode)
-      return changelogCall(e, st)
+		case OpDirStat:
+			// FIXME: backup/load must restore an accurate directory-stat baseline.
+			// FIXME: coordinate pending and in-flight dir-stat updates with this resync to avoid double-counting.
+			inode, err := e.Ino(0)
+			if err != nil {
+				return err
+			}
+			_, st := dst.en.doSyncDirStat(ctx, inode)
+			return changelogCall(e, st)
 		case OpRepairDir:
 			return r.repairDir(ctx, e)
 		case OpUpdateToken:
@@ -859,7 +859,15 @@ func (r *Replayer) write(ctx Context, e *ChangeEntry) error {
 		return err
 	}
 	slice := Slice{Id: sliceId, Size: sliceLen, Len: sliceLen}
-	return changelogCall(e, r.dst.Write(ctx, inode, indx, off, slice, time.Unix(mtime, int64(mtimensec))))
+	ts := time.Unix(mtime, int64(mtimensec))
+	if len(e.Args) == 8 {
+		eof, err := e.Uint64(7)
+		if err != nil {
+			return err
+		}
+		return changelogCall(e, r.dst.WriteEOF(ctx, inode, indx, off, slice, ts, eof))
+	}
+	return changelogCall(e, r.dst.Write(ctx, inode, indx, off, slice, ts))
 }
 
 func (r *Replayer) compactChunk(ctx Context, e *ChangeEntry) error {

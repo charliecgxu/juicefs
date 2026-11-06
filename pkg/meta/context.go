@@ -23,6 +23,22 @@ import (
 
 type CtxKey string
 
+const fileLengthKey CtxKey = "sparseFileLength"
+
+// WithFileLength carries the real EOF for a Write whose logical slice coverage
+// is larger than the file. The stored slice is unchanged.
+func WithFileLength(ctx Context, length uint64) Context {
+	return ctx.WithValue(fileLengthKey, length)
+}
+
+func fileLengthFrom(ctx Context) (uint64, bool) {
+	if ctx == nil {
+		return 0, false
+	}
+	n, ok := ctx.Value(fileLengthKey).(uint64)
+	return n, ok
+}
+
 type Context interface {
 	context.Context
 	Gid() uint32

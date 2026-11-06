@@ -23,12 +23,18 @@ type openFile struct {
 	lastCheck int64
 	first     []Slice
 	chunks    map[uint32][]Slice
+	firstRaw  []OverlaySlice
+	rawChunks map[uint32][]OverlaySlice
 }
 
 func (o *openFile) invalidateChunk() {
 	o.first = nil
+	o.firstRaw = nil
 	for c := range o.chunks {
 		delete(o.chunks, c)
+	}
+	for c := range o.rawChunks {
+		delete(o.rawChunks, c)
 	}
 }
 
@@ -38,6 +44,8 @@ func (o *openFile) release() {
 	o.lastCheck = 0
 	o.first = nil
 	o.chunks = nil
+	o.firstRaw = nil
+	o.rawChunks = nil
 	ofPool.Put(o)
 }
 
@@ -235,6 +243,37 @@ func (o *openfiles) CacheChunk(ino Ino, indx uint32, cs []Slice) {
 	}
 }
 
+func (o *openfiles) ReadOverlayChunk(ino Ino, indx uint32) ([]OverlaySlice, bool) {
+	o.Lock()
+	defer o.Unlock()
+	of, ok := o.files[ino]
+	if !ok {
+		return nil, false
+	}
+	if indx == 0 {
+		return of.firstRaw, of.firstRaw != nil
+	}
+	cs, ok := of.rawChunks[indx]
+	return cs, ok
+}
+
+func (o *openfiles) CacheOverlayChunk(ino Ino, indx uint32, cs []OverlaySlice) {
+	o.Lock()
+	defer o.Unlock()
+	of, ok := o.files[ino]
+	if !ok {
+		return
+	}
+	if indx == 0 {
+		of.firstRaw = cs
+	} else {
+		if of.rawChunks == nil {
+			of.rawChunks = make(map[uint32][]OverlaySlice)
+		}
+		of.rawChunks[indx] = cs
+	}
+}
+
 func (o *openfiles) InvalidateChunk(ino Ino, indx uint32) {
 	o.Lock()
 	defer o.Unlock()
@@ -244,8 +283,10 @@ func (o *openfiles) InvalidateChunk(ino Ino, indx uint32) {
 			of.invalidateChunk()
 		} else if indx == 0 {
 			of.first = nil
+			of.firstRaw = nil
 		} else {
 			delete(of.chunks, indx)
+			delete(of.rawChunks, indx)
 		}
 		of.lastCheck = 0
 	}

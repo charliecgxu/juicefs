@@ -3572,7 +3572,7 @@ func (m *dbMeta) doWrite(ctx Context, inode Ino, indx uint32, off uint32, slice 
 		if nodeAttr.Type != TypeFile {
 			return syscall.EPERM
 		}
-		newleng := uint64(indx)*ChunkSize + uint64(off) + uint64(slice.Len)
+		newleng := sliceCommitLength(ctx, indx, off, slice)
 		if newleng > nodeAttr.Length {
 			delta.length = int64(newleng - nodeAttr.Length)
 			delta.space = align4K(newleng) - align4K(nodeAttr.Length)
@@ -3587,21 +3587,41 @@ func (m *dbMeta) doWrite(ctx Context, inode Ino, indx uint32, off uint32, slice 
 		m.parseAttr(&nodeAttr, attr)
 
 		buf := marshalSlice(off, slice.Id, slice.Size, slice.Off, slice.Len)
+		duplicateSparse := false
 		var insert bool // no compaction check for the first slice
-		if err = m.upsertSlice(s, inode, indx, buf, &insert); err != nil {
-			return err
+		if IsSparseSliceID(slice.Id) {
+			ck := chunk{Inode: inode, Indx: indx}
+			ok, getErr := s.ForUpdate().MustCols("indx").Get(&ck)
+			if getErr != nil {
+				return getErr
+			}
+			if ok {
+				if existing := findSliceByID(readSliceBuf(ck.Slices), slice.Id); existing != nil {
+					if !sameSliceRecord(existing, off, slice) {
+						return syscall.EINVAL
+					}
+					duplicateSparse = true
+					*numSlices = len(ck.Slices) / sliceBytes
+				}
+			}
 		}
-		if err = mustInsert(s, sliceRef{slice.Id, slice.Size, 1}); err != nil {
-			return err
+		if !duplicateSparse {
+			if err = m.upsertSlice(s, inode, indx, buf, &insert); err != nil {
+				return err
+			}
+			if err = mustInsert(s, sliceRef{slice.Id, slice.Size, 1}); err != nil {
+				return err
+			}
 		}
 		_, err = s.Cols("length", "mtime", "ctime", "mtimensec", "ctimensec").Update(&nodeAttr, &node{Inode: inode})
-		if err == nil && !insert {
+		if err == nil && !insert && !duplicateSparse {
 			ck := chunk{Inode: inode, Indx: indx}
 			_, _ = s.MustCols("indx").Get(&ck)
 			*numSlices = len(ck.Slices) / sliceBytes
 		}
 		if err == nil {
-			m.genLog(ctx, s, now, "WRITE(%d,%d,%d,%d,%d,%d,%d):%d", inode, indx, off, slice.Id, slice.Len, attr.Mtime, attr.Mtimensec, *numSlices)
+			format, args := writeLogArgs(ctx, inode, indx, off, slice, attr.Mtime, attr.Mtimensec, *numSlices)
+			m.genLog(ctx, s, now, format, args...)
 		}
 		return err
 	}, inode))

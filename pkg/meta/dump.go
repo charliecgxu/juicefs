@@ -619,8 +619,9 @@ func decodeEntry(dec *json.Decoder, parent Ino, cs *DumpedCounters, parents map[
 						if addChunk != nil && refs[ck] == 1 {
 							addChunk(&ck)
 						}
-						if cs.NextChunk <= int64(s.Id) {
-							cs.NextChunk = int64(s.Id) + 1
+						counterID := s.Id &^ SparseSliceBit
+						if cs.NextChunk <= int64(counterID) {
+							cs.NextChunk = int64(counterID) + 1
 						}
 					}
 				}

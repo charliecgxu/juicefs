@@ -523,16 +523,21 @@ func (s *wSlice) Abort() {
 
 // Config contains options for cachedStore
 type Config struct {
-	CacheDir               string
-	CacheMode              os.FileMode
-	CacheSize              uint64
-	CacheItems             int64
-	CacheChecksum          string
-	CacheEviction          string
-	CacheScanInterval      time.Duration
-	CacheExpire            time.Duration
-	OSCache                bool
-	FreeSpace              float32
+	CacheDir          string
+	CacheMode         os.FileMode
+	CacheSize         uint64
+	CacheItems        int64
+	CacheChecksum     string
+	CacheEviction     string
+	CacheScanInterval time.Duration
+	CacheExpire       time.Duration
+	OSCache           bool
+	FreeSpace         float32
+	// StageUsageHigh is the sparse staging usage / configured cache capacity
+	// ratio that triggers background publication. 0 disables the watermark.
+	StageUsageHigh float32
+	// SparseChunkSlice keeps one sparse 64 MiB local generation per inode/chunk.
+	SparseChunkSlice       bool
 	AutoCreate             bool
 	Compress               string
 	MaxUpload              int
@@ -604,11 +609,26 @@ func (c *Config) SelfCheck(uuid string) {
 		if c.WritebackThresholdSize == 0 {
 			c.WritebackThresholdSize = c.BlockSize + 1
 		}
+		if c.SparseChunkSlice {
+			if c.StageUsageHigh < 0 {
+				c.StageUsageHigh = 0
+			} else if c.StageUsageHigh > 1 {
+				logger.Warnf("stage-usage-high-ratio should be in [0,1], got %v, set to 1", c.StageUsageHigh)
+				c.StageUsageHigh = 1
+			}
+		} else {
+			c.StageUsageHigh = 0
+		}
 	} else {
 		if c.UploadDelay > 0 || c.UploadHours != "" {
 			logger.Warnf("delayed upload is disabled in non-writeback mode")
 			c.UploadDelay = 0
 			c.UploadHours = ""
+		}
+		c.StageUsageHigh = 0
+		if c.SparseChunkSlice {
+			logger.Warnf("sparse-chunk-slice requires writeback; disabling it")
+			c.SparseChunkSlice = false
 		}
 	}
 	if _, _, err := c.parseHours(); err != nil {
@@ -661,22 +681,26 @@ func (c *Config) CacheEnabled() bool {
 }
 
 type cachedStore struct {
-	storage         object.ObjectStorage
-	bcache          CacheManager
-	fetcher         *prefetcher
-	conf            Config
-	group           *Controller
-	currentUpload   chan struct{}
-	currentDownload chan struct{}
-	pendingCh       chan *pendingItem
-	pendingKeys     map[string]*pendingItem
-	pendingMutex    sync.Mutex
-	startHour       int
-	endHour         int
-	compressor      compress.Compressor
-	seekable        bool
-	upLimit         *ratelimit.Bucket
-	downLimit       *ratelimit.Bucket
+	storage            object.ObjectStorage
+	bcache             CacheManager
+	fetcher            *prefetcher
+	conf               Config
+	group              *Controller
+	currentUpload      chan struct{}
+	currentDownload    chan struct{}
+	pendingCh          chan *pendingItem
+	pendingKeys        map[string]*pendingItem
+	pendingMutex       sync.Mutex
+	sparseManifestMu   sync.Mutex
+	sparseManifests    map[uint64]*sparseManifest
+	sparseStageMu      sync.Mutex
+	sparseStageRemover func(uint64) error
+	startHour          int
+	endHour            int
+	compressor         compress.Compressor
+	seekable           bool
+	upLimit            *ratelimit.Bucket
+	downLimit          *ratelimit.Bucket
 
 	cacheHits           prometheus.Counter
 	cacheMiss           prometheus.Counter
@@ -854,6 +878,7 @@ func NewCachedStore(storage object.ObjectStorage, config Config, reg prometheus.
 		seekable:        compressor.CompressBound(0) == 0,
 		pendingCh:       make(chan *pendingItem, 100*config.MaxUpload),
 		pendingKeys:     make(map[string]*pendingItem),
+		sparseManifests: make(map[uint64]*sparseManifest),
 		group:           NewController(),
 	}
 	if config.UploadLimit > 0 {
@@ -1183,6 +1208,9 @@ func (store *cachedStore) NewWriter(id uint64, tierID uint8) Writer {
 }
 
 func (store *cachedStore) Remove(id uint64, length int) error {
+	if IsSparseSliceID(id) {
+		return store.RemoveSparse(id)
+	}
 	r := sliceForRead(id, length, store)
 	return r.Remove()
 }

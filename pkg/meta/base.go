@@ -2211,9 +2211,13 @@ func (m *baseMeta) Read(ctx Context, inode Ino, indx uint32, slices *[]Slice) (s
 		return 0
 	}
 
+	sparse := hasSparseSlice(ss)
 	*slices = buildSlice(ss)
 	m.of.CacheChunk(inode, indx, *slices)
-	if !m.conf.ReadOnly && (len(ss) >= 5 || len(*slices) >= 5) {
+	if sparse {
+		m.of.CacheOverlayChunk(inode, indx, buildOverlaySlices(ss))
+	}
+	if !sparse && !m.conf.ReadOnly && (len(ss) >= 5 || len(*slices) >= 5) {
 		tierID := -1
 		if f != nil {
 			tierID = int(f.attr.Tier)
@@ -2221,6 +2225,49 @@ func (m *baseMeta) Read(ctx Context, inode Ino, indx uint32, slices *[]Slice) (s
 		go m.compactChunk(inode, indx, false, false, tierID)
 	}
 	return 0
+}
+
+func (m *baseMeta) ReadOverlay(ctx Context, inode Ino, indx uint32, slices *[]OverlaySlice) syscall.Errno {
+	if ss, ok := m.of.ReadOverlayChunk(inode, indx); ok {
+		*slices = ss
+		return 0
+	}
+	ss, st := m.en.doRead(ctx, inode, indx)
+	if st != 0 {
+		return st
+	}
+	if ss == nil {
+		return syscall.EIO
+	}
+	if hasSparseSlice(ss) {
+		*slices = buildOverlaySlices(ss)
+		m.of.CacheOverlayChunk(inode, indx, *slices)
+		return 0
+	}
+	dense := buildSlice(ss)
+	*slices = make([]OverlaySlice, 0, len(dense))
+	var pos uint32
+	for _, s := range dense {
+		*slices = append(*slices, OverlaySlice{Slice: s, Pos: pos})
+		pos += s.Len
+	}
+	m.of.CacheOverlayChunk(inode, indx, *slices)
+	return 0
+}
+
+func (m *baseMeta) ReadHybrid(ctx Context, inode Ino, indx uint32, slices *[]Slice, overlays *[]OverlaySlice) (bool, syscall.Errno) {
+	if st := m.Read(ctx, inode, indx, slices); st != 0 {
+		return false, st
+	}
+	for _, s := range *slices {
+		if IsSparseSliceID(s.Id) {
+			if st := m.ReadOverlay(ctx, inode, indx, overlays); st != 0 {
+				return true, st
+			}
+			return true, 0
+		}
+	}
+	return false, 0
 }
 
 func (m *baseMeta) NewSlice(ctx Context, id *uint64) syscall.Errno {
@@ -2255,6 +2302,14 @@ func (m *baseMeta) Close(ctx Context, inode Ino) syscall.Errno {
 }
 
 func (m *baseMeta) Write(ctx Context, inode Ino, indx uint32, off uint32, slice Slice, mtime time.Time) syscall.Errno {
+	return m.write(ctx, inode, indx, off, slice, mtime)
+}
+
+func (m *baseMeta) WriteEOF(ctx Context, inode Ino, indx uint32, off uint32, slice Slice, mtime time.Time, eof uint64) syscall.Errno {
+	return m.write(WithFileLength(ctx, eof), inode, indx, off, slice, mtime)
+}
+
+func (m *baseMeta) write(ctx Context, inode Ino, indx uint32, off uint32, slice Slice, mtime time.Time) syscall.Errno {
 	defer m.timeit("Write", time.Now())
 	f := m.of.find(inode)
 	if f != nil {
@@ -2931,6 +2986,11 @@ func (m *baseMeta) compactChunk(inode Ino, indx uint32, once, force bool, tierID
 
 	ss, st := m.en.doRead(Background(), inode, indx)
 	if st != 0 {
+		return
+	}
+	if hasSparseSlice(ss) {
+		// TODO: compact sparse manifests without applying dense overlay rules.
+		logger.Debugf("skip compaction for sparse chunk %d:%d", inode, indx)
 		return
 	}
 	if ss == nil {

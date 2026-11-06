@@ -270,6 +270,49 @@ type fileWriter struct {
 	commitcond *utils.Cond // wait for committed==true of dependency slice (commit)
 }
 
+type sparseFileWriter struct {
+	sync.Mutex
+	w      *dataWriter
+	inode  Ino
+	length uint64
+}
+
+func (f *sparseFileWriter) Write(_ meta.Context, off uint64, data []byte) syscall.Errno {
+	f.Lock()
+	defer f.Unlock()
+	if err := f.w.sparse.Write(f.inode, off, data, f.length); err != nil {
+		logger.Errorf("stage sparse write inode %d off %d: %s", f.inode, off, err)
+		return syscall.EIO
+	}
+	f.length = max(f.length, off+uint64(len(data)))
+	f.w.reader.Truncate(f.inode, f.length)
+	return 0
+}
+
+func (f *sparseFileWriter) Flush(_ meta.Context) syscall.Errno {
+	if err := f.w.sparse.SyncInode(f.inode); err != nil {
+		logger.Errorf("sync sparse staging inode %d: %s", f.inode, err)
+		return syscall.EIO
+	}
+	return 0
+}
+
+func (f *sparseFileWriter) Close(ctx meta.Context) syscall.Errno {
+	return f.Flush(ctx)
+}
+
+func (f *sparseFileWriter) GetLength() uint64 {
+	f.Lock()
+	defer f.Unlock()
+	return max(f.length, f.w.sparse.Length(f.inode))
+}
+
+func (f *sparseFileWriter) Truncate(length uint64) {
+	f.Lock()
+	f.length = length
+	f.Unlock()
+}
+
 // protected by file
 func (f *fileWriter) findChunk(i uint32) *chunkWriter {
 	c := f.chunks[i]
@@ -483,6 +526,7 @@ type dataWriter struct {
 	bufferSize int64
 	files      map[Ino]*fileWriter
 	maxRetries uint32
+	sparse     *sparseStaging
 }
 
 func NewDataWriter(conf *Config, m meta.Meta, store chunk.ChunkStore, reader DataReader) DataWriter {
@@ -496,7 +540,15 @@ func NewDataWriter(conf *Config, m meta.Meta, store chunk.ChunkStore, reader Dat
 		files:      make(map[Ino]*fileWriter),
 		maxRetries: uint32(conf.Meta.Retries),
 	}
-	go w.flushAll()
+	if conf.Chunk.SparseChunkSlice {
+		sparse, err := newSparseStaging(conf, m, store, reader)
+		if err != nil {
+			logger.Fatalf("initialize sparse staging: %s", err)
+		}
+		w.sparse = sparse
+	} else {
+		go w.flushAll()
+	}
 	return w
 }
 
@@ -531,6 +583,9 @@ func (w *dataWriter) flushAll() {
 }
 
 func (w *dataWriter) Open(inode Ino, len uint64, tierID uint8) FileWriter {
+	if w.sparse != nil {
+		return &sparseFileWriter{w: w, inode: inode, length: max(len, w.sparse.Length(inode))}
+	}
 	w.Lock()
 	defer w.Unlock()
 	f, ok := w.files[inode]
@@ -567,6 +622,12 @@ func (w *dataWriter) free(f *fileWriter) {
 }
 
 func (w *dataWriter) Flush(ctx meta.Context, inode Ino) syscall.Errno {
+	if w.sparse != nil {
+		if err := w.sparse.SyncInode(inode); err != nil {
+			return syscall.EIO
+		}
+		return 0
+	}
 	f := w.find(inode)
 	if f != nil {
 		return f.Flush(ctx)
@@ -575,6 +636,9 @@ func (w *dataWriter) Flush(ctx meta.Context, inode Ino) syscall.Errno {
 }
 
 func (w *dataWriter) GetLength(inode Ino) uint64 {
+	if w.sparse != nil {
+		return w.sparse.Length(inode)
+	}
 	f := w.find(inode)
 	if f != nil {
 		return f.GetLength()
@@ -583,6 +647,11 @@ func (w *dataWriter) GetLength(inode Ino) uint64 {
 }
 
 func (w *dataWriter) Truncate(inode Ino, len uint64) {
+	if w.sparse != nil {
+		// Sparse truncation publication is not implemented yet; VFS currently
+		// routes truncate through the existing global metadata operation.
+		return
+	}
 	f := w.find(inode)
 	if f != nil {
 		f.Truncate(len)
@@ -590,6 +659,9 @@ func (w *dataWriter) Truncate(inode Ino, len uint64) {
 }
 
 func (w *dataWriter) UpdateMtime(inode Ino, mtime time.Time) {
+	if w.sparse != nil {
+		return
+	}
 	f := w.find(inode)
 	if f != nil {
 		f.updateMtime(mtime)
@@ -597,6 +669,9 @@ func (w *dataWriter) UpdateMtime(inode Ino, mtime time.Time) {
 }
 
 func (w *dataWriter) FlushAll() error {
+	if w.sparse != nil {
+		return w.sparse.SyncAll()
+	}
 	var err error
 	w.Lock()
 	for inode, ind := range w.files {

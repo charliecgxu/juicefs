@@ -97,6 +97,10 @@ func configManagementFlags() []cli.Flag {
 			Usage: "enable user and group quota management",
 		},
 		&cli.BoolFlag{
+			Name:  "enable-sparse-chunk",
+			Usage: "enable the incompatible packed sparse chunk format",
+		},
+		&cli.BoolFlag{
 			Name:  "changelog",
 			Usage: "enable changelog",
 		},
@@ -179,7 +183,7 @@ func config(ctx *cli.Context) error {
 
 	originDirStats := format.DirStats
 	originUGQuota := format.UserGroupQuota
-	var quota, storage, trash, clientVer, tier bool
+	var quota, storage, trash, clientVer, tier, metaVersionUpgrade bool
 	var msg strings.Builder
 	encrypted := format.KeyEncrypted
 	var targetTierID uint8
@@ -344,6 +348,15 @@ func config(ctx *cli.Context) error {
 			if new := ctx.Bool(flag); new != format.UserGroupQuota {
 				msg.WriteString(fmt.Sprintf("%10s: %t -> %t\n", flag, format.UserGroupQuota, new))
 				format.UserGroupQuota = new
+			}
+		case "enable-sparse-chunk":
+			if !ctx.Bool(flag) {
+				return errors.New("cannot disable packed sparse chunk format")
+			}
+			if format.MetaVersion < meta.SparseFormatVersion {
+				msg.WriteString(fmt.Sprintf("%10s: metadata format %d -> %d\n", flag, format.MetaVersion, meta.SparseFormatVersion))
+				format.MetaVersion = meta.SparseFormatVersion
+				metaVersionUpgrade = true
 			}
 		case "min-client-version":
 			if new := ctx.String(flag); new != format.MinClientVersion {
@@ -539,7 +552,7 @@ func config(ctx *cli.Context) error {
 			logger.Fatalf("Format encrypt: %s", err)
 		}
 	}
-	if err = m.Init(format, false); err == nil {
+	if err = m.Init(format, metaVersionUpgrade); err == nil {
 		fmt.Println(msg.String()[:msg.Len()-1])
 	}
 

@@ -202,6 +202,12 @@ JuiceFS 客户端会把从对象存储下载的数据，以及新上传的小于
 * 软件编译
 * 大数据任务的临时存储场景，比如 Spark shuffle
 
+#### 实验性稀疏可控暂存
+
+`--sparse-chunk-slice` 是 `--writeback` 的实验性扩展。随机写会覆盖每个文件 Chunk 对应的一个本地稀疏 64 MiB generation；首次 `fsync`、`flush` 或 close 会在本地 checkpoint 后登记一条稳定的中心 slice，后续同步幂等复用该记录，不会不断增加 slice。使用 `juicefs flush-staging` 只上传 packed payload 和 manifest；暂存空间达到高水位时也可以触发保护性发布。
+
+首次启用前必须执行 `juicefs config META-URL --enable-sparse-chunk`，将元数据格式不可逆地升级到版本 2，使不支持 packed sparse 格式的客户端拒绝挂载。Put 完成前 manifest 尚不存在，其他客户端不能读取已经登记的 sparse slice；该模式只适用于应用能够保证单写者并控制跨节点读取时序的场景。该模式目前不支持 truncate、fallocate 和 copy-file-range，也尚未实现 sparse compact、完整 GC、压缩、上传限速和 tier 集成。设计、文件格式、故障语义及其他限制请参见[稀疏可控暂存设计与实现](../development/sparse_controlled_staging.md)。
+
 启用 `--writeback` 模式后，除了直接查看 `/var/jfsCache/<UUID>/rawstaging/` 目录，还可以通过以下命令确定文件上传进度：
 
 ```shell

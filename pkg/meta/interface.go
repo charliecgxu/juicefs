@@ -33,12 +33,19 @@ import (
 )
 
 const (
+	// DefaultFormatVersion remains readable by unmodified community clients.
+	DefaultFormatVersion = 1
 	// MaxVersion is the max of supported versions.
-	MaxVersion = 1
+	MaxVersion = 2
+	// SparseFormatVersion rejects clients that do not understand packed sparse slices.
+	SparseFormatVersion = 2
 	// ChunkBits is the size of a chunk.
 	ChunkBits = 26
 	// ChunkSize is size of a chunk
 	ChunkSize = 1 << ChunkBits // 64M
+	// SparseSliceBit marks manifest-backed sparse slices while remaining
+	// positive in signed 64-bit SQL columns.
+	SparseSliceBit uint64 = 1 << 62
 	// DeleteSlice is a message to delete a slice from object store.
 	DeleteSlice = 1000
 	// CompactChunk is a message to compact a chunk in object store.
@@ -57,6 +64,8 @@ const (
 	OpSummary = 1007
 	// CompactPath is a message to trigger compact
 	CompactPath = 1008
+	// FlushStaging is a message to publish sparse staging generations.
+	FlushStaging = 1009
 )
 
 const (
@@ -343,6 +352,26 @@ type Slice struct {
 	Len  uint32
 }
 
+func IsSparseSliceID(id uint64) bool {
+	return id&SparseSliceBit != 0
+}
+
+type OverlaySlice struct {
+	Slice
+	Pos uint32
+}
+
+// OverlayReader exposes positioned write records for sparse-aware clients.
+// It is separate from Meta so third-party Meta implementations remain source
+// compatible until sparse slices are enabled.
+type OverlayReader interface {
+	ReadOverlay(ctx Context, inode Ino, indx uint32, slices *[]OverlaySlice) syscall.Errno
+}
+
+type HybridReader interface {
+	ReadHybrid(ctx Context, inode Ino, indx uint32, slices *[]Slice, overlays *[]OverlaySlice) (bool, syscall.Errno)
+}
+
 // Summary represents the total number of files/directories and
 // total length of all files inside a directory.
 type Summary struct {
@@ -504,6 +533,9 @@ type Meta interface {
 	NewSlice(ctx Context, id *uint64) syscall.Errno
 	// Write put a slice of data on top of the given chunk.
 	Write(ctx Context, inode Ino, indx uint32, off uint32, slice Slice, mtime time.Time) syscall.Errno
+	// WriteEOF is Write with an explicit real EOF. It is used by sparse slices
+	// whose logical coverage is a full chunk but whose file may be shorter.
+	WriteEOF(ctx Context, inode Ino, indx uint32, off uint32, slice Slice, mtime time.Time, eof uint64) syscall.Errno
 	// InvalidateChunkCache invalidate chunk cache
 	InvalidateChunkCache(ctx Context, inode Ino, indx uint32) syscall.Errno
 	// CopyFileRange copies part of a file to another one.

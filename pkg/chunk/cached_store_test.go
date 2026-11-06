@@ -305,6 +305,80 @@ func TestStoreAsync(t *testing.T) {
 	}
 }
 
+func TestSparseManifestReadAndCorruption(t *testing.T) {
+	mem, _ := object.CreateStorage("mem", "", "", "", "")
+	conf := defaultConf
+	conf.CacheDir = t.TempDir()
+	store := NewCachedStore(mem, conf, nil).(*cachedStore)
+
+	id := SparseSliceBit | 501
+	dataBitmap := make([]byte, SparseBitmapSize)
+	zeroBitmap := make([]byte, SparseBitmapSize)
+	dataBitmap[0] = 1 << 2
+	zeroBitmap[0] = 1 << 4
+	_, err := store.UploadSparse(context.Background(), id, 5*SparsePageSize,
+		dataBitmap, zeroBitmap, func(page int, data []byte) error {
+			require.Equal(t, 2, page)
+			copy(data, bytes.Repeat([]byte{7}, len(data)))
+			return nil
+		})
+	require.NoError(t, err)
+
+	page := make([]byte, SparsePageSize)
+	state, err := store.ReadSparsePage(context.Background(), id, 1, page)
+	require.NoError(t, err)
+	require.Equal(t, SparsePageInherit, state)
+	state, err = store.ReadSparsePage(context.Background(), id, 2, page)
+	require.NoError(t, err)
+	require.Equal(t, SparsePageData, state)
+	require.Equal(t, bytes.Repeat([]byte{7}, len(page)), page)
+	state, err = store.ReadSparsePage(context.Background(), id, 4, page)
+	require.NoError(t, err)
+	require.Equal(t, SparsePageZero, state)
+	require.Equal(t, make([]byte, len(page)), page)
+
+	states := make([]SparsePageState, 4)
+	pages := bytes.Repeat([]byte{9}, len(states)*SparsePageSize)
+	require.NoError(t, store.ReadSparsePages(context.Background(), id, 1, states, pages))
+	require.Equal(t, []SparsePageState{SparsePageInherit, SparsePageData, SparsePageInherit, SparsePageZero}, states)
+	require.Equal(t, bytes.Repeat([]byte{7}, SparsePageSize), pages[SparsePageSize:2*SparsePageSize])
+	require.Equal(t, make([]byte, SparsePageSize), pages[3*SparsePageSize:])
+
+	require.NoError(t, store.RemoveSparse(id))
+	_, err = mem.Head(context.Background(), store.sparseManifestKey(id))
+	require.Error(t, err)
+
+	partialID := SparseSliceBit | 502
+	partialKey := store.sparsePrefix(partialID) + "_partial"
+	require.NoError(t, mem.Put(context.Background(), partialKey, bytes.NewReader([]byte("partial"))))
+	var removedID uint64
+	store.SetSparseStageRemover(func(id uint64) error {
+		removedID = id
+		return nil
+	})
+	require.NoError(t, store.RemoveSparse(partialID))
+	require.Equal(t, partialID, removedID)
+	_, err = mem.Head(context.Background(), partialKey)
+	require.Error(t, err)
+
+	failedID := SparseSliceBit | 503
+	failedKey := store.sparsePrefix(failedID) + "_partial"
+	require.NoError(t, mem.Put(context.Background(), failedKey, bytes.NewReader([]byte("partial"))))
+	store.SetSparseStageRemover(func(uint64) error { return errors.New("stage busy") })
+	require.EqualError(t, store.RemoveSparse(failedID), "stage busy")
+	_, err = mem.Head(context.Background(), failedKey)
+	require.NoError(t, err)
+	store.SetSparseStageRemover(nil)
+
+	missingID := SparseSliceBit | 504
+	_, err = store.ReadSparsePage(context.Background(), missingID, 0, page)
+	require.Error(t, err)
+	corruptID := SparseSliceBit | 505
+	require.NoError(t, mem.Put(context.Background(), store.sparseManifestKey(corruptID), bytes.NewReader([]byte("bad"))))
+	_, err = store.ReadSparsePage(context.Background(), corruptID, 0, page)
+	require.Error(t, err)
+}
+
 func TestForceUpload(t *testing.T) {
 	blob, _ := object.CreateStorage("mem", "", "", "", "")
 	config := defaultConf
