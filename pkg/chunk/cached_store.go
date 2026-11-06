@@ -523,21 +523,16 @@ func (s *wSlice) Abort() {
 
 // Config contains options for cachedStore
 type Config struct {
-	CacheDir          string
-	CacheMode         os.FileMode
-	CacheSize         uint64
-	CacheItems        int64
-	CacheChecksum     string
-	CacheEviction     string
-	CacheScanInterval time.Duration
-	CacheExpire       time.Duration
-	OSCache           bool
-	FreeSpace         float32
-	// StageUsageHigh is the sparse staging usage / configured cache capacity
-	// ratio that triggers background publication. 0 disables the watermark.
-	StageUsageHigh float32
-	// SparseChunkSlice keeps one sparse 64 MiB local generation per inode/chunk.
-	SparseChunkSlice       bool
+	CacheDir               string
+	CacheMode              os.FileMode
+	CacheSize              uint64
+	CacheItems             int64
+	CacheChecksum          string
+	CacheEviction          string
+	CacheScanInterval      time.Duration
+	CacheExpire            time.Duration
+	OSCache                bool
+	FreeSpace              float32
 	AutoCreate             bool
 	Compress               string
 	MaxUpload              int
@@ -559,6 +554,12 @@ type Config struct {
 	BufferSize             uint64
 	Readahead              int
 	Prefetch               int
+
+	// StageUsageHigh is the sparse staging usage / configured cache capacity
+	// ratio that triggers background publication. 0 disables the watermark.
+	StageUsageHigh float32
+	// SparseChunkSlice keeps one sparse 64 MiB local generation per inode/chunk.
+	SparseChunkSlice bool
 }
 
 func (c *Config) SelfCheck(uuid string) {
@@ -681,26 +682,27 @@ func (c *Config) CacheEnabled() bool {
 }
 
 type cachedStore struct {
-	storage            object.ObjectStorage
-	bcache             CacheManager
-	fetcher            *prefetcher
-	conf               Config
-	group              *Controller
-	currentUpload      chan struct{}
-	currentDownload    chan struct{}
-	pendingCh          chan *pendingItem
-	pendingKeys        map[string]*pendingItem
-	pendingMutex       sync.Mutex
+	storage         object.ObjectStorage
+	bcache          CacheManager
+	fetcher         *prefetcher
+	conf            Config
+	group           *Controller
+	currentUpload   chan struct{}
+	currentDownload chan struct{}
+	pendingCh       chan *pendingItem
+	pendingKeys     map[string]*pendingItem
+	pendingMutex    sync.Mutex
+	startHour       int
+	endHour         int
+	compressor      compress.Compressor
+	seekable        bool
+	upLimit         *ratelimit.Bucket
+	downLimit       *ratelimit.Bucket
+
 	sparseManifestMu   sync.Mutex
 	sparseManifests    map[uint64]*sparseManifest
 	sparseStageMu      sync.Mutex
 	sparseStageRemover func(uint64) error
-	startHour          int
-	endHour            int
-	compressor         compress.Compressor
-	seekable           bool
-	upLimit            *ratelimit.Bucket
-	downLimit          *ratelimit.Bucket
 
 	cacheHits           prometheus.Counter
 	cacheMiss           prometheus.Counter
