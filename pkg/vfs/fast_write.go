@@ -1458,6 +1458,66 @@ func (o *fastWrite) finishMetadataFlush(file *fastWriteFile, epoch uint64, flush
 	file.Unlock()
 }
 
+// zeroWholePageLocked 将一整页标记为显式零页。
+// v1 磁盘格式中 bit=1 且 chunk 文件对应位置为 hole 即表示全零页
+//（见 docs/zh_cn/development/fast-write-design.md），因此置位图即可，
+// 无需任何读改写与零数据落盘；该页已有本地数据时先 punch hole 丢弃，
+// 文件系统不支持 punch 时才回退为读-清零-写整页。
+// 修复：原实现对 punch-hole/fallocate 逐页写入 4KiB 零页，mke2fs 对整个
+// 文件 discard 时被放大为逐页 I/O（实测 1GiB 文件 = 26 万次 pwrite）。
+func (o *fastWrite) zeroWholePageLocked(file *fastWriteFile, generation *fastWriteGeneration,
+	chunkIndex, page uint32, remote fastWriteRemoteReader) syscall.Errno {
+	chunk := ensureFastWriteChunk(generation, chunkIndex)
+	key := fastWriteFDKey{file.inode, generation.ID, chunkIndex}
+	if !bitmapGet(chunk.Bitmap, page) {
+		// 新页：chunk 文件此处是 hole，置位即表达全零页，零数据 I/O。
+		// 但必须保证 chunk 文件已创建：readPageLocked / upload 对 bit=1 的
+		// 页一律以 create=false 打开本地 chunk 文件，文件不存在会误报 EIO。
+		// getFD 有缓存，每个 chunk 只在首次触达时有 open+ftruncate 成本。
+		if _, err := o.getFD(key, true); err != nil {
+			return syscall.EIO
+		}
+		bitmapSet(chunk.Bitmap, page)
+		markFastWriteMutationLocked(file)
+		return 0
+	}
+	dataFile, err := o.getFD(key, true)
+	if err != nil {
+		return syscall.EIO
+	}
+	punchErr := unix.Fallocate(int(dataFile.Fd()), unix.FALLOC_FL_PUNCH_HOLE|unix.FALLOC_FL_KEEP_SIZE,
+		int64(uint64(page)*fastWritePageSize), int64(fastWritePageSize))
+	if punchErr == nil {
+		o.markFDDirty(key)
+		bitmapSet(chunk.Bitmap, page)
+		markFastWriteMutationLocked(file)
+		o.releaseFD(key)
+		return 0
+	}
+	// 回退：保持原有读-清零-写整页语义
+	pageData := make([]byte, fastWritePageSize)
+	if errno := o.readPageLocked(file, chunkIndex, page, pageData, remote); errno != 0 {
+		o.releaseFD(key)
+		return errno
+	}
+	clear(pageData)
+	written, writeErr := o.writeFile(dataFile, pageData, int64(uint64(page)*fastWritePageSize))
+	o.releaseFD(key)
+	if writeErr == nil && written != len(pageData) {
+		writeErr = io.ErrShortWrite
+	}
+	if writeErr != nil {
+		if errors.Is(writeErr, syscall.ENOSPC) {
+			return syscall.ENOSPC
+		}
+		return syscall.EIO
+	}
+	bitmapSet(chunk.Bitmap, page)
+	o.markFDDirty(key)
+	markFastWriteMutationLocked(file)
+	return 0
+}
+
 func (o *fastWrite) zeroRangeLocked(file *fastWriteFile, off, length uint64, remote fastWriteRemoteReader) syscall.Errno {
 	if length == 0 {
 		return 0
@@ -1473,20 +1533,27 @@ func (o *fastWrite) zeroRangeLocked(file *fastWriteFile, off, length uint64, rem
 		page := uint32(chunkOff / fastWritePageSize)
 		pageOff := int(chunkOff % fastWritePageSize)
 		n := min(int(end-off), int(fastWritePageSize)-pageOff)
-		pageData := make([]byte, fastWritePageSize)
-		if pageOff != 0 || n != int(fastWritePageSize) {
-			if errno := o.readPageLocked(file, chunkIndex, page, pageData, remote); errno != 0 {
+		if pageOff == 0 && n == int(fastWritePageSize) {
+			// 整页显式清零：只置位图（bit=1 + hole = 全零页）
+			if errno := o.zeroWholePageLocked(file, generation, chunkIndex, page, remote); errno != 0 {
 				return errno
 			}
+			off += uint64(n)
+			continue
 		}
-		clear(pageData[pageOff : pageOff+n])
+		// 部分页：保持原有读-改-写语义
 		chunk := ensureFastWriteChunk(generation, chunkIndex)
 		key := fastWriteFDKey{file.inode, generation.ID, chunkIndex}
 		dataFile, err := o.getFD(key, true)
 		if err != nil {
 			return syscall.EIO
 		}
-		newPage := !bitmapGet(chunk.Bitmap, page)
+		pageData := make([]byte, fastWritePageSize)
+		if errno := o.readPageLocked(file, chunkIndex, page, pageData, remote); errno != 0 {
+			o.releaseFD(key)
+			return errno
+		}
+		clear(pageData[pageOff : pageOff+n])
 		written, writeErr := o.writeFile(dataFile, pageData, int64(uint64(page)*fastWritePageSize))
 		if writeErr == nil && written != len(pageData) {
 			writeErr = io.ErrShortWrite
@@ -1495,7 +1562,7 @@ func (o *fastWrite) zeroRangeLocked(file *fastWriteFile, off, length uint64, rem
 			bitmapSet(chunk.Bitmap, page)
 			o.markFDDirty(key)
 			markFastWriteMutationLocked(file)
-		} else if !newPage && written > 0 {
+		} else if written > 0 {
 			o.markFDDirty(key)
 			markFastWriteMutationLocked(file)
 		}

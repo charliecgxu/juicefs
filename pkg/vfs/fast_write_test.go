@@ -1731,9 +1731,13 @@ func TestFastWritePartialZeroRangeFailureKeepsCompletedPageDirty(t *testing.T) {
 		}
 		return writeFullAtCount(file, data, off)
 	}
-	start := uint64(meta.ChunkSize) - fastWritePageSize
+	// 整页清零只置位图（bit=1 + hole = 零页），没有可失败的写 I/O，因此用跨
+	// chunk 边界的部分页清零构造"第 2 次数据写失败"：页1（chunk0 尾页后半）
+	// RMW 成功提交，页2（chunk1 首页前半）RMW 失败，不提交。
+	delta := fastWritePageSize / 8
+	start := uint64(meta.ChunkSize) - fastWritePageSize + delta
 	require.Equal(t, syscall.EIO, fastWrite.ZeroRange(
-		42, uint64(meta.ChunkSize)+fastWritePageSize, start, fastWritePageSize*2, true, remote))
+		42, uint64(meta.ChunkSize)+fastWritePageSize, start, fastWritePageSize*2-delta*2, true, remote))
 
 	file := fastWrite.get(42)
 	require.NotNil(t, file)
@@ -1757,7 +1761,10 @@ func TestFastWritePartialZeroRangeFailureKeepsCompletedPageDirty(t *testing.T) {
 	n, errno := fastWrite.Read(42, start, got, remote)
 	require.Zero(t, errno)
 	require.Equal(t, len(got), n)
-	require.Equal(t, make([]byte, fastWritePageSize), got)
+	// 已完成的页1尾部为零，失败的页2头部回落到远端数据 'r'
+	want := append(bytes.Repeat([]byte{0}, int(fastWritePageSize-delta)),
+		bytes.Repeat([]byte{'r'}, int(delta))...)
+	require.Equal(t, want, got)
 }
 
 func TestFastWriteFDEvictionFailureRollsBackNewEntry(t *testing.T) {
