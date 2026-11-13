@@ -302,6 +302,10 @@ type chunkObj struct {
 func (v *VFS) handleInternalMsg(ctx meta.Context, cmd uint32, r *utils.Buffer, out io.Writer) {
 	switch cmd {
 	case meta.Rmr:
+		if v.fastWrite != nil {
+			_, _ = out.Write([]byte{uint8(syscall.EOPNOTSUPP)})
+			return
+		}
 		done := make(chan struct{})
 		inode := Ino(r.Get64())
 		name := string(r.Get(int(r.Get8())))
@@ -331,6 +335,10 @@ func (v *VFS) handleInternalMsg(ctx meta.Context, cmd uint32, r *utils.Buffer, o
 		}
 		_, _ = out.Write([]byte{uint8(st)})
 	case meta.Clone:
+		if v.fastWrite != nil {
+			_, _ = out.Write([]byte{uint8(syscall.EOPNOTSUPP)})
+			return
+		}
 		done := make(chan struct{})
 		srcIno := Ino(r.Get64())
 		srcParentIno := Ino(r.Get64())
@@ -591,6 +599,28 @@ func (v *VFS) handleInternalMsg(ctx meta.Context, cmd uint32, r *utils.Buffer, o
 		writeProgress(&totalChunks, &currChunks, out, done)
 		_, _ = out.Write([]byte{uint8(eno)})
 
+	case meta.UploadFastWrite:
+		paths, background, ok := decodeUploadFastWriteRequest(r)
+		if !ok {
+			_, _ = out.Write([]byte{uint8(syscall.EINVAL)})
+			return
+		}
+		stat, eno := v.uploadFastWritePaths(ctx, paths, background)
+		if eno != 0 {
+			_, _ = out.Write([]byte{uint8(eno)})
+			return
+		}
+		data, err := json.Marshal(stat)
+		if err != nil {
+			_, _ = out.Write([]byte{byte(syscall.EIO & 0xff)})
+			return
+		}
+		w := utils.NewBuffer(uint32(1 + 4 + len(data)))
+		w.Put8(meta.CDATA)
+		w.Put32(uint32(len(data)))
+		w.Put(data)
+		_, _ = out.Write(w.Bytes())
+
 	case meta.FillCache:
 		paths := strings.Split(string(r.Get(int(r.Get32()))), "\n")
 		concurrent := r.Get16()
@@ -628,4 +658,29 @@ func (v *VFS) handleInternalMsg(ctx meta.Context, cmd uint32, r *utils.Buffer, o
 		logger.Warnf("unknown message type: %d", cmd)
 		_, _ = out.Write([]byte{byte(syscall.EINVAL & 0xff)})
 	}
+}
+
+func decodeUploadFastWriteRequest(r *utils.Buffer) ([]string, bool, bool) {
+	if r.Left() < 5 {
+		return nil, false, false
+	}
+	count := r.Get32()
+	if uint64(count) > uint64((r.Left()-1)/4) {
+		return nil, false, false
+	}
+	paths := make([]string, 0, count)
+	for range count {
+		if r.Left() < 4 {
+			return nil, false, false
+		}
+		length := r.Get32()
+		if length == 0 || r.Left() < 1 || uint64(length) > uint64(r.Left()-1) {
+			return nil, false, false
+		}
+		paths = append(paths, string(r.Get(int(length))))
+	}
+	if r.Left() != 1 {
+		return nil, false, false
+	}
+	return paths, r.Get8() != 0, true
 }

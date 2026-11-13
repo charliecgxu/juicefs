@@ -57,6 +57,11 @@ const (
 	OpSummary = 1007
 	// CompactPath is a message to trigger compact
 	CompactPath = 1008
+	// privateControlCommandBase keeps fork-local controls away from the
+	// sequential command IDs allocated by the community edition.
+	privateControlCommandBase uint32 = 0xF0000000
+	// UploadFastWrite materializes unpublished Fast Write data into normal slices.
+	UploadFastWrite = privateControlCommandBase + 1
 )
 
 const (
@@ -502,7 +507,8 @@ type Meta interface {
 	Read(ctx Context, inode Ino, indx uint32, slices *[]Slice) syscall.Errno
 	// NewSlice returns an id for new slice.
 	NewSlice(ctx Context, id *uint64) syscall.Errno
-	// Write put a slice of data on top of the given chunk.
+	// Write puts a slice of data on top of the given chunk. A zero mtime
+	// preserves the inode's current mtime.
 	Write(ctx Context, inode Ino, indx uint32, off uint32, slice Slice, mtime time.Time) syscall.Errno
 	// InvalidateChunkCache invalidate chunk cache
 	InvalidateChunkCache(ctx Context, inode Ino, indx uint32) syscall.Errno

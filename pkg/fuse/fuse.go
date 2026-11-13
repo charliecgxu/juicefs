@@ -292,11 +292,14 @@ func (fs *fileSystem) Release(cancel <-chan struct{}, in *fuse.ReleaseIn) {
 func (fs *fileSystem) Write(cancel <-chan struct{}, in *fuse.WriteIn, data []byte) (written uint32, code fuse.Status) {
 	ctx := fs.newContext(cancel, &in.InHeader)
 	defer releaseContext(ctx)
-	err := fs.v.Write(ctx, Ino(in.NodeId), data, in.Offset, in.Fh)
+	written, err := fs.v.WriteWithCount(ctx, Ino(in.NodeId), data, in.Offset, in.Fh)
+	if written > 0 {
+		return written, 0
+	}
 	if err != 0 {
 		return 0, fuse.Status(err)
 	}
-	return uint32(len(data)), 0
+	return 0, 0
 }
 
 func (fs *fileSystem) Flush(cancel <-chan struct{}, in *fuse.FlushIn) fuse.Status {
@@ -329,10 +332,13 @@ func (fs *fileSystem) CopyFileRange(cancel <-chan struct{}, in *fuse.CopyFileRan
 		len = math.MaxUint32 + 1 - meta.ChunkSize
 	}
 	copied, err := fs.v.CopyFileRange(ctx, Ino(in.NodeId), in.FhIn, in.OffIn, Ino(in.NodeIdOut), in.FhOut, in.OffOut, len, uint32(in.Flags))
+	if copied > 0 {
+		return uint32(copied), 0
+	}
 	if err != 0 {
 		return 0, fuse.Status(err)
 	}
-	return uint32(copied), 0
+	return 0, 0
 }
 
 func (fs *fileSystem) GetLk(cancel <-chan struct{}, in *fuse.LkIn, out *fuse.LkOut) (code fuse.Status) {
@@ -490,6 +496,7 @@ func Serve(v *vfs.VFS, options string, xattrs, ioctl bool) error {
 	opt.DontUmask = conf.Format.EnableACL
 	opt.DisableXAttrs = !xattrs
 	opt.EnableIoctl = ioctl
+	opt.EnableWriteback = conf.FuseOpts.EnableWriteback
 	opt.MaxWrite = conf.FuseOpts.MaxWrite
 	opt.MaxReadAhead = 1 << 20
 	opt.DirectMount = true
@@ -539,6 +546,14 @@ func Serve(v *vfs.VFS, options string, xattrs, ioctl bool) error {
 			}
 		}
 		return fmt.Errorf("fuse: %s", err)
+	}
+	if conf.FuseMaxDirtyRatio > 0 {
+		var actualRatio int
+		if actualRatio, err = setMaxDirtyRatio(conf.Meta.MountPoint, conf.FuseMaxDirtyRatio); err != nil {
+			logger.Warnf("set FUSE max dirty ratio to %d: %s", conf.FuseMaxDirtyRatio, err)
+		} else {
+			logger.Infof("Set FUSE max dirty ratio to %d (requested %d)", actualRatio, conf.FuseMaxDirtyRatio)
+		}
 	}
 	defer func() {
 		if runtime.GOOS == "darwin" {

@@ -80,6 +80,7 @@ func Main(args []string) error {
 			cmdObjbench(),
 			cmdMdtest(),
 			cmdWarmup(),
+			cmdUploadFastWrite(),
 			cmdRmr(),
 			cmdSync(),
 			cmdDebug(),

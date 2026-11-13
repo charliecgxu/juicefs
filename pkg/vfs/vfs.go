@@ -121,6 +121,10 @@ type SecurityConfig struct {
 	EnableSELinux bool
 }
 
+// DefaultFastWriteSyncConcurrency is the default maximum number of
+// concurrent Fast Write fdatasync calls per mount.
+const DefaultFastWriteSyncConcurrency = 16
+
 type Config struct {
 	Meta *meta.Config
 	// Format is the startup snapshot; Meta.GetFormat returns the current one
@@ -151,9 +155,19 @@ type Config struct {
 	CommPath  string       `json:",omitempty"`
 	StatePath string       `json:",omitempty"`
 	FuseOpts  *FuseOptions `json:",omitempty"`
+	// FuseMaxDirtyRatio limits this Linux FUSE mount's share of the global
+	// dirty-page budget. Zero leaves the kernel default unchanged.
+	FuseMaxDirtyRatio int `json:",omitempty"`
 
 	// the mount point for current volume (to follow symlink)
 	Mountpoint string
+
+	// FastWriteDir stores unpublished file data on the local filesystem.
+	// It is intentionally separate from the evictable chunk cache.
+	FastWriteDir string `json:",omitempty"`
+	// FastWriteSyncConcurrency limits concurrent fdatasync calls across all
+	// Fast Write inodes. Zero uses DefaultFastWriteSyncConcurrency.
+	FastWriteSyncConcurrency int `json:",omitempty"`
 }
 
 type AnonymousAccount struct {
@@ -214,6 +228,7 @@ func (v *VFS) GetAttr(ctx Context, ino Ino, opened uint8) (entry *meta.Entry, er
 	var attr = &Attr{}
 	err = v.Meta.GetAttr(ctx, ino, attr)
 	if err == 0 {
+		v.UpdateLength(ino, attr)
 		entry = &meta.Entry{Inode: ino, Attr: attr}
 	}
 	return
@@ -271,8 +286,62 @@ func (v *VFS) Unlink(ctx Context, parent Ino, name string) (err syscall.Errno) {
 	return v.doUnlink(ctx, parent, name, false)
 }
 
+func (v *VFS) lockFastWriteLifecycle() func() {
+	if v.fastWrite == nil {
+		return func() {}
+	}
+	v.fastWriteLifecycleMu.Lock()
+	return v.fastWriteLifecycleMu.Unlock
+}
+
+func (v *VFS) fastWriteTrashEnabled() bool {
+	return v.fastWrite != nil && (v.fastWriteTrashBlocked || v.Meta.GetFormat().TrashDays > 0)
+}
+
+// detachFastWriteInode applies the last-link removal to a regular file.
+// The caller holds fastWriteLifecycleMu. A file with no local overlay yet,
+// such as O_TMPFILE before the first write, is remembered until link or the
+// last close.
+func (v *VFS) detachFastWriteInode(inode Ino) {
+	if v.fastWrite == nil || inode == 0 {
+		return
+	}
+	if len(v.findAllHandles(inode)) == 0 {
+		v.fastWritePending.Delete(inode)
+		if removeErr := v.fastWrite.remove(inode); removeErr != nil {
+			logger.Warnf("remove Fast Write for unlinked inode %d: %s", inode, removeErr)
+		}
+		return
+	}
+	if v.fastWrite.get(inode) == nil {
+		v.fastWritePending.Store(inode, struct{}{})
+		return
+	}
+	v.fastWritePending.Delete(inode)
+	if markErr := v.fastWrite.markDeleted(inode); markErr != nil {
+		logger.Warnf("mark Fast Write inode %d deleted: %s", inode, markErr)
+	}
+}
+
+// BlockFastWriteForTrash permanently fails destructive namespace operations
+// closed after a mounted volume attempts to enable trash.
+func (v *VFS) BlockFastWriteForTrash() {
+	if v.fastWrite == nil {
+		return
+	}
+	v.fastWriteLifecycleMu.Lock()
+	v.fastWriteTrashBlocked = true
+	v.fastWriteLifecycleMu.Unlock()
+}
+
 func (v *VFS) doUnlink(ctx Context, parent Ino, name string, skipTrash bool) (err syscall.Errno) {
 	defer func() { logit(ctx, "unlink", err, "(%d,%s)", parent, name) }()
+	unlockLifecycle := v.lockFastWriteLifecycle()
+	defer unlockLifecycle()
+	if v.fastWriteTrashEnabled() {
+		err = syscall.EOPNOTSUPP
+		return
+	}
 	if parent == rootID && IsSpecialName(name) {
 		err = syscall.EPERM
 		return
@@ -281,9 +350,17 @@ func (v *VFS) doUnlink(ctx Context, parent Ino, name string, skipTrash bool) (er
 		err = syscall.ENAMETOOLONG
 		return
 	}
+	var removed Ino
+	var removedAttr Attr
+	if v.fastWrite != nil {
+		_ = v.Meta.Lookup(ctx, parent, name, &removed, &removedAttr, true)
+	}
 	err = v.Meta.Unlink(ctx, parent, name, skipTrash)
 	if err == 0 {
 		v.invalidateDirHandle(parent, name, 0, nil)
+		if v.fastWrite != nil && removed != 0 && removedAttr.Typ == meta.TypeFile && removedAttr.Nlink <= 1 {
+			v.detachFastWriteInode(removed)
+		}
 	}
 	return
 }
@@ -357,6 +434,12 @@ func (v *VFS) Rename(ctx Context, parent Ino, name string, newparent Ino, newnam
 	defer func() {
 		logit(ctx, "rename", err, "(%d,%s,%d,%s,%d)", parent, name, newparent, newname, flags)
 	}()
+	unlockLifecycle := v.lockFastWriteLifecycle()
+	defer unlockLifecycle()
+	if v.fastWriteTrashEnabled() {
+		err = syscall.EOPNOTSUPP
+		return
+	}
 	if parent == rootID && IsSpecialName(name) {
 		err = syscall.EPERM
 		return
@@ -370,6 +453,11 @@ func (v *VFS) Rename(ctx Context, parent Ino, name string, newparent Ino, newnam
 		return
 	}
 
+	var replaced Ino
+	var replacedAttr Attr
+	if v.fastWrite != nil && flags != meta.RenameExchange {
+		_ = v.Meta.Lookup(ctx, newparent, newname, &replaced, &replacedAttr, true)
+	}
 	var inode Ino
 	var attr = &Attr{}
 	err = v.Meta.Rename(ctx, parent, name, newparent, newname, flags, &inode, attr)
@@ -377,6 +465,9 @@ func (v *VFS) Rename(ctx Context, parent Ino, name string, newparent Ino, newnam
 		v.invalidateDirHandle(parent, name, 0, nil)
 		v.invalidateDirHandle(newparent, newname, 0, nil)
 		v.invalidateDirHandle(newparent, newname, inode, attr)
+		if v.fastWrite != nil && replaced != 0 && replaced != inode && replacedAttr.Typ == meta.TypeFile && replacedAttr.Nlink <= 1 {
+			v.detachFastWriteInode(replaced)
+		}
 	}
 	return
 }
@@ -385,6 +476,8 @@ func (v *VFS) Link(ctx Context, ino Ino, newparent Ino, newname string) (entry *
 	defer func() {
 		logit(ctx, "link", err, "(%d,%d,%s):%s", ino, newparent, newname, (*Entry)(entry))
 	}()
+	unlockLifecycle := v.lockFastWriteLifecycle()
+	defer unlockLifecycle()
 	if IsSpecialNode(ino) {
 		err = syscall.EPERM
 		return
@@ -398,8 +491,30 @@ func (v *VFS) Link(ctx Context, ino Ino, newparent Ino, newname string) (entry *
 		return
 	}
 
+	restoreDeleted := v.fastWrite != nil && v.fastWrite.isDeleted(ino)
+	if restoreDeleted {
+		if unmarkErr := v.fastWrite.unmarkDeleted(ino); unmarkErr != nil {
+			logger.Errorf("prepare Fast Write inode %d for link: %s", ino, unmarkErr)
+			err = syscall.EIO
+			return
+		}
+	}
+	var restorePending bool
+	if v.fastWrite != nil {
+		_, restorePending = v.fastWritePending.LoadAndDelete(ino)
+	}
 	var attr = &Attr{}
 	err = v.Meta.Link(ctx, ino, newparent, newname, attr)
+	if err != 0 {
+		if restorePending {
+			v.fastWritePending.Store(ino, struct{}{})
+		}
+		if restoreDeleted {
+			if markErr := v.fastWrite.markDeleted(ino); markErr != nil {
+				logger.Errorf("restore deleted Fast Write inode %d after failed link: %s", ino, markErr)
+			}
+		}
+	}
 	if err == 0 {
 		entry = &meta.Entry{Inode: ino, Attr: attr}
 		v.invalidateDirHandle(newparent, newname, ino, attr)
@@ -430,6 +545,11 @@ func (v *VFS) Opendir(ctx Context, ino Ino, flags uint32) (fh uint64, err syscal
 func (v *VFS) UpdateLength(inode Ino, attr *meta.Attr) {
 	if attr.Full && attr.Typ == meta.TypeFile {
 		length := v.writer.GetLength(inode)
+		if v.fastWrite != nil {
+			if fastWriteLength, ok := v.fastWrite.Length(inode); ok && fastWriteLength > length {
+				length = fastWriteLength
+			}
+		}
 		if length > attr.Length {
 			attr.Length = length
 		}
@@ -508,7 +628,7 @@ func (v *VFS) Create(ctx Context, parent Ino, name string, mode uint16, cumask u
 	defer func() {
 		logit(ctx, "create", err, "(%d,%s,%s:0%04o):%s [fh:%d]", parent, name, smode(mode), mode, (*Entry)(entry), fh)
 	}()
-	// O_TMPFILE support
+	// O_TMPFILE support: create a temporary name, then unlink it immediately.
 	doUnlink := runtime.GOOS == "linux" && flags&O_TMPFILE != 0
 	if doUnlink {
 		name = fmt.Sprintf("tmpfile_%s", uuid.New().String())
@@ -627,6 +747,72 @@ func (v *VFS) Truncate(ctx Context, ino Ino, size int64, fh uint64, attr *Attr) 
 			h.Wunlock()
 		}(h)
 	}
+	if v.fastWriteInitErr != nil {
+		return syscall.EIO
+	}
+	if v.fastWrite != nil {
+		var remoteAttr Attr
+		if err = v.Meta.GetAttr(ctx, ino, &remoteAttr); err != 0 {
+			return
+		}
+		if remoteAttr.Typ != meta.TypeFile {
+			return syscall.EPERM
+		}
+		if remoteAttr.Flags&(meta.FlagImmutable|meta.FlagAppend) != 0 {
+			return syscall.EPERM
+		}
+		if fh == 0 {
+			if err = v.Meta.Access(ctx, ino, MODE_MASK_W, &remoteAttr); err != 0 {
+				return
+			}
+			check := remoteAttr
+			check.Length = uint64(size)
+			if err = v.Meta.CheckSetAttr(ctx, ino, meta.SetAttrSize, check); err != 0 {
+				return
+			}
+		}
+		mutation, mutationErrno := v.fastWrite.lockMutation(ino, remoteAttr.Length)
+		if mutationErrno != 0 {
+			return mutationErrno
+		}
+		defer mutation.release()
+		remoteAttr.Length = mutation.originalLength
+		if uint64(size) < remoteAttr.Length {
+			return syscall.EOPNOTSUPP
+		}
+		if uint64(size) == remoteAttr.Length {
+			*attr = remoteAttr
+			return 0
+		}
+		flags := uint8(0)
+		skipPermCheck := false
+		if fh != 0 {
+			flags = 1
+			skipPermCheck = true
+		}
+		if err = v.Meta.Truncate(ctx, ino, flags, uint64(size), attr, skipPermCheck); err != 0 {
+			return
+		}
+		var remote FileReader
+		for _, h := range hs {
+			if h.reader != nil {
+				remote = h.reader
+				break
+			}
+		}
+		if remote == nil {
+			remote = v.reader.Open(ino, remoteAttr.Length)
+			defer remote.Close(ctx)
+		}
+		err = v.fastWrite.truncateWithMutation(mutation, uint64(size), func(remoteOff uint64, dst []byte) (int, syscall.Errno) {
+			return remote.Read(ctx, remoteOff, dst)
+		})
+		if err == 0 {
+			v.reader.Truncate(ino, uint64(size))
+			v.invalidateAttr(ino)
+		}
+		return
+	}
 	_ = v.writer.Flush(ctx, ino)
 	if fh == 0 {
 		err = v.Meta.Truncate(ctx, ino, 0, uint64(size), attr, false)
@@ -682,7 +868,11 @@ func (v *VFS) Release(ctx Context, ino Ino, fh uint64) {
 			powner := f.ofdOwner
 			f.Unlock()
 			if f.writer != nil {
-				_ = f.writer.Flush(ctx)
+				if v.fastWrite != nil {
+					_ = v.flushFastWriteMetadata(ctx, ino)
+				} else {
+					_ = f.writer.Flush(ctx)
+				}
 				v.invalidateAttr(ino)
 			}
 			if locks&1 != 0 {
@@ -693,7 +883,33 @@ func (v *VFS) Release(ctx Context, ino Ino, fh uint64) {
 			}
 		}
 		_ = v.Meta.Close(ctx, ino)
-		go v.releaseFileHandle(ino, fh) // after writes it waits for data sync, so do it after everything
+		go func() {
+			v.releaseFileHandle(ino, fh) // after writes it waits for data sync, so do it after everything
+			if v.fastWrite == nil {
+				return
+			}
+			_, pending := v.fastWritePending.Load(ino)
+			if !pending && !v.fastWrite.isDeleted(ino) {
+				return
+			}
+			unlockLifecycle := v.lockFastWriteLifecycle()
+			defer unlockLifecycle()
+			if len(v.findAllHandles(ino)) != 0 {
+				return
+			}
+			_, pending = v.fastWritePending.Load(ino)
+			deleted := v.fastWrite.isDeleted(ino)
+			if !pending && !deleted {
+				return
+			}
+			v.fastWritePending.Delete(ino)
+			if v.fastWrite.get(ino) == nil {
+				return
+			}
+			if removeErr := v.fastWrite.remove(ino); removeErr != nil {
+				logger.Warnf("remove Fast Write for released inode %d: %s", ino, removeErr)
+			}
+		}()
 	}
 }
 
@@ -792,10 +1008,23 @@ func (v *VFS) Read(ctx Context, ino Ino, buf []byte, off uint64, fh uint64) (n i
 	}
 	defer h.Runlock()
 
-	_ = v.writer.Flush(ctx, ino)
-	n, err = h.reader.Read(ctx, off, buf)
-	for err == syscall.EAGAIN {
+	if v.fastWrite == nil {
+		_ = v.writer.Flush(ctx, ino)
 		n, err = h.reader.Read(ctx, off, buf)
+	} else {
+		v.fastWrite.growRemoteLength(ino, h.reader.GetLength())
+		n, err = v.fastWrite.Read(ino, off, buf, func(remoteOff uint64, dst []byte) (int, syscall.Errno) {
+			return h.reader.Read(ctx, remoteOff, dst)
+		})
+	}
+	for err == syscall.EAGAIN {
+		if v.fastWrite == nil {
+			n, err = h.reader.Read(ctx, off, buf)
+		} else {
+			n, err = v.fastWrite.Read(ino, off, buf, func(remoteOff uint64, dst []byte) (int, syscall.Errno) {
+				return h.reader.Read(ctx, remoteOff, dst)
+			})
+		}
 	}
 	if err == syscall.ENOENT {
 		err = syscall.EBADF
@@ -804,12 +1033,21 @@ func (v *VFS) Read(ctx Context, ino Ino, buf []byte, off uint64, fh uint64) (n i
 	return
 }
 
-func (v *VFS) Write(ctx Context, ino Ino, buf []byte, off, fh uint64) (err syscall.Errno) {
+func (v *VFS) Write(ctx Context, ino Ino, buf []byte, off, fh uint64) syscall.Errno {
+	_, err := v.write(ctx, ino, buf, off, fh)
+	return err
+}
+
+func (v *VFS) WriteWithCount(ctx Context, ino Ino, buf []byte, off, fh uint64) (uint32, syscall.Errno) {
+	return v.write(ctx, ino, buf, off, fh)
+}
+
+func (v *VFS) write(ctx Context, ino Ino, buf []byte, off, fh uint64) (written uint32, err syscall.Errno) {
 	size := uint64(len(buf))
 	if ino == controlInode && runtime.GOOS == "darwin" {
 		fh = v.getControlHandle(ctx.Pid())
 	}
-	defer func() { logit(ctx, "write", err, "(%d,%d,%d,%d)", ino, size, off, fh) }()
+	defer func() { logit(ctx, "write", err, "(%d,%d,%d,%d):%d", ino, size, off, fh, written) }()
 	h := v.findHandle(ino, fh)
 	if h == nil {
 		err = syscall.EBADF
@@ -824,20 +1062,21 @@ func (v *VFS) Write(ctx Context, ino Ino, buf []byte, off, fh uint64) (err sysca
 		h.Lock()
 		defer h.Unlock()
 		h.pending = append(h.pending, buf...)
+		written = uint32(len(buf))
 		rb := utils.ReadBuffer(h.pending)
 		cmd := rb.Get32()
-		size := int(rb.Get32())
-		if rb.Left() < size {
-			logger.Debugf("message not complete: %d %d > %d", cmd, size, rb.Left())
+		messageSize := int(rb.Get32())
+		if rb.Left() < messageSize {
+			logger.Debugf("message not complete: %d %d > %d", cmd, messageSize, rb.Left())
 			return
 		}
 		h.data = append(h.data, h.pending...)
 		h.pending = h.pending[:0]
-		if rb.Left() == size {
+		if rb.Left() == messageSize {
 			h.bctx = meta.NewContext(ctx.Pid(), ctx.Uid(), ctx.Gids())
 			go v.handleInternalMsg(h.bctx, cmd, rb, h)
 		} else {
-			logger.Warnf("broken message: %d %d < %d", cmd, size, rb.Left())
+			logger.Warnf("broken message: %d %d < %d", cmd, messageSize, rb.Left())
 			h.data = append(h.data, uint8(syscall.EIO&0xff))
 		}
 		return
@@ -854,15 +1093,79 @@ func (v *VFS) Write(ctx Context, ino Ino, buf []byte, off, fh uint64) (err sysca
 	}
 	defer h.Wunlock()
 
-	err = h.writer.Write(ctx, off, buf)
+	metadataChanged := false
+	if v.fastWriteInitErr != nil {
+		err = syscall.EIO
+	} else if v.fastWrite != nil {
+		remoteLength := h.reader.GetLength()
+		if size == 0 {
+			err = 0
+		} else {
+			guard, beginErrno := v.fastWrite.beginWrite(ino, remoteLength, off, size)
+			if beginErrno != 0 {
+				err = beginErrno
+				h.removeOp(ctx)
+				return
+			}
+			originalLength := guard.originalLength
+			deleted := guard.file.deleted
+			if end := off + size; end > originalLength {
+				if deleted {
+					v.reader.Truncate(ino, end)
+				} else {
+					var attr Attr
+					if err = v.Meta.Truncate(ctx, ino, 1, end, &attr, true); err != 0 {
+						guard.release()
+						h.removeOp(ctx)
+						return
+					}
+					v.reader.Truncate(ino, end)
+				}
+				metadataChanged = true
+			}
+			var count int
+			count, err = v.fastWrite.writeLocked(guard, off, buf, func(remoteOff uint64, dst []byte) (int, syscall.Errno) {
+				return h.reader.Read(ctx, remoteOff, dst)
+			})
+			written = uint32(count)
+			requestedEnd := off + size
+			if uint64(written) < size && requestedEnd > originalLength {
+				committedEnd := originalLength
+				if written > 0 {
+					committedEnd = max(originalLength, off+uint64(written))
+				}
+				if committedEnd < requestedEnd {
+					if deleted {
+						v.reader.Truncate(ino, committedEnd)
+					} else {
+						var attr Attr
+						if truncateErrno := v.Meta.Truncate(ctx, ino, 1, committedEnd, &attr, true); truncateErrno != 0 {
+							err = truncateErrno
+							markFastWriteMetadataDirtyLocked(guard.file)
+						} else {
+							v.reader.Truncate(ino, committedEnd)
+						}
+					}
+				}
+			}
+			guard.release()
+		}
+	} else {
+		err = h.writer.Write(ctx, off, buf)
+		if err == 0 {
+			written = uint32(size)
+		}
+	}
 	if err == syscall.ENOENT || err == syscall.EPERM || err == syscall.EINVAL {
 		err = syscall.EBADF
 	}
 	h.removeOp(ctx)
 
-	if err == 0 {
-		writtenSizeHistogram.Observe(float64(len(buf)))
-		v.reader.Invalidate(ino, off, size)
+	if written > 0 {
+		writtenSizeHistogram.Observe(float64(written))
+		v.reader.Invalidate(ino, off, uint64(written))
+	}
+	if written > 0 || metadataChanged {
 		v.invalidateAttr(ino)
 	}
 	return
@@ -898,6 +1201,79 @@ func (v *VFS) Fallocate(ctx Context, ino Ino, mode uint8, off, size int64, fh ui
 	defer h.Wunlock()
 	defer h.removeOp(ctx)
 
+	if v.fastWriteInitErr != nil {
+		return syscall.EIO
+	}
+	if v.fastWrite != nil {
+		const (
+			fallocKeepSize    = uint8(0x01)
+			fallocPunchHole   = uint8(0x02)
+			fallocCollapse    = uint8(0x08)
+			fallocZeroRange   = uint8(0x10)
+			fallocInsertRange = uint8(0x20)
+		)
+		const supported = fallocKeepSize | fallocPunchHole | fallocCollapse | fallocZeroRange | fallocInsertRange
+		if mode & ^uint8(supported) != 0 {
+			return syscall.EOPNOTSUPP
+		}
+		switch mode {
+		case fallocCollapse, fallocInsertRange:
+			return syscall.EOPNOTSUPP
+		case 0, fallocKeepSize, fallocPunchHole | fallocKeepSize,
+			fallocZeroRange, fallocZeroRange | fallocKeepSize:
+		default:
+			return syscall.EINVAL
+		}
+		var remoteAttr Attr
+		if err = v.Meta.GetAttr(ctx, ino, &remoteAttr); err != 0 {
+			return
+		}
+		if remoteAttr.Typ != meta.TypeFile {
+			return syscall.EPERM
+		}
+		if remoteAttr.Flags&meta.FlagImmutable != 0 ||
+			remoteAttr.Flags&meta.FlagAppend != 0 && mode&^fallocKeepSize != 0 {
+			return syscall.EPERM
+		}
+		mutation, mutationErrno := v.fastWrite.lockMutation(ino, remoteAttr.Length)
+		if mutationErrno != 0 {
+			return mutationErrno
+		}
+		defer mutation.release()
+		remoteAttr.Length = mutation.originalLength
+		remote := func(remoteOff uint64, dst []byte) (int, syscall.Errno) {
+			return h.reader.Read(ctx, remoteOff, dst)
+		}
+		currentLength := remoteAttr.Length
+		if mode&fallocKeepSize == 0 && uint64(off+size) > currentLength {
+			var attr Attr
+			if err = v.Meta.Truncate(ctx, ino, 1, uint64(off+size), &attr, true); err != 0 {
+				return
+			}
+			currentLength = uint64(off + size)
+			remoteAttr.Length = currentLength
+			v.reader.Truncate(ino, currentLength)
+			mutation.file.Lock()
+			growFastWriteFileLocked(mutation.file, currentLength)
+			mutation.file.Unlock()
+		}
+		if mode&(fallocPunchHole|fallocZeroRange) != 0 {
+			zeroSize := uint64(size)
+			if mode&fallocKeepSize != 0 && uint64(off)+zeroSize > currentLength {
+				if uint64(off) >= currentLength {
+					zeroSize = 0
+				} else {
+					zeroSize = currentLength - uint64(off)
+				}
+			}
+			err = v.fastWrite.zeroRangeWithMutation(mutation, uint64(off), zeroSize, mode&fallocKeepSize != 0, remote)
+		}
+		if err == 0 {
+			v.reader.Invalidate(ino, uint64(off), uint64(size))
+			v.invalidateAttr(ino)
+		}
+		return
+	}
 	err = v.writer.Flush(ctx, ino)
 	if err != 0 {
 		return
@@ -976,6 +1352,81 @@ func (v *VFS) CopyFileRange(ctx Context, nodeIn Ino, fhIn, offIn uint64, nodeOut
 		defer hi.removeOp(ctx)
 	}
 
+	if v.fastWriteInitErr != nil {
+		return 0, syscall.EIO
+	}
+	if v.fastWrite != nil {
+		srcLength := hi.reader.GetLength()
+		if offIn >= srcLength {
+			return 0, 0
+		}
+		logicalSize := min(size, srcLength-offIn)
+		if logicalSize == 0 {
+			return 0, 0
+		}
+
+		var remoteSrcAttr, remoteDstAttr Attr
+		if err = v.Meta.GetAttr(ctx, nodeIn, &remoteSrcAttr); err != 0 {
+			return 0, err
+		}
+		if err = v.Meta.GetAttr(ctx, nodeOut, &remoteDstAttr); err != 0 {
+			return 0, err
+		}
+		if remoteDstAttr.Typ != meta.TypeFile {
+			return 0, syscall.EPERM
+		}
+		if remoteDstAttr.Flags&(meta.FlagImmutable|meta.FlagAppend) != 0 {
+			return 0, syscall.EPERM
+		}
+		mutation, mutationErrno := v.fastWrite.lockMutation(nodeOut, remoteDstAttr.Length)
+		if mutationErrno != 0 {
+			return 0, mutationErrno
+		}
+		defer mutation.release()
+		originalDstLength := mutation.originalLength
+		requestedEnd := offOut + logicalSize
+		if requestedEnd > originalDstLength {
+			var attr Attr
+			if err = v.Meta.Truncate(ctx, nodeOut, 1, requestedEnd, &attr, true); err != 0 {
+				return 0, err
+			}
+			v.reader.Truncate(nodeOut, requestedEnd)
+		}
+		srcRemote := func(remoteOff uint64, dst []byte) (int, syscall.Errno) {
+			return hi.reader.Read(ctx, remoteOff, dst)
+		}
+		dstRemote := func(remoteOff uint64, dst []byte) (int, syscall.Errno) {
+			return ho.reader.Read(ctx, remoteOff, dst)
+		}
+		copied, err = v.fastWrite.copyRangeWithMutation(mutation, nodeIn, remoteSrcAttr.Length,
+			offIn, offOut, logicalSize, srcRemote, dstRemote)
+		if copied < logicalSize && requestedEnd > originalDstLength {
+			committedEnd := originalDstLength
+			if copied > 0 {
+				committedEnd = max(originalDstLength, offOut+copied)
+			}
+			if committedEnd < requestedEnd {
+				var attr Attr
+				if truncateErrno := v.Meta.Truncate(ctx, nodeOut, 1, committedEnd, &attr, true); truncateErrno != 0 {
+					err = truncateErrno
+					if file := v.fastWrite.get(nodeOut); file != nil {
+						file.Lock()
+						markFastWriteMetadataDirtyLocked(file)
+						file.Unlock()
+					}
+				} else {
+					v.reader.Truncate(nodeOut, committedEnd)
+				}
+			}
+		}
+		if copied > 0 {
+			v.reader.Invalidate(nodeOut, offOut, copied)
+		}
+		if copied > 0 || requestedEnd > originalDstLength {
+			v.invalidateAttr(nodeOut)
+		}
+		return
+	}
 	err = v.writer.Flush(ctx, nodeIn)
 	if err != 0 {
 		return
@@ -1017,7 +1468,13 @@ func (v *VFS) Flush(ctx Context, ino Ino, fh uint64, lockOwner uint64) (err sysc
 			h.cancelOp(ctx.Pid())
 		}
 
-		err = h.writer.Flush(ctx)
+		if v.fastWriteInitErr != nil {
+			err = syscall.EIO
+		} else if v.fastWrite != nil {
+			err = v.flushFastWriteMetadata(ctx, ino)
+		} else {
+			err = h.writer.Flush(ctx)
+		}
 		if err == syscall.ENOENT || err == syscall.EPERM || err == syscall.EINVAL {
 			err = syscall.EBADF
 		}
@@ -1056,7 +1513,13 @@ func (v *VFS) Fsync(ctx Context, ino Ino, datasync int, fh uint64) (err syscall.
 		defer h.Wunlock()
 		defer h.removeOp(ctx)
 
-		err = h.writer.Flush(ctx)
+		if v.fastWriteInitErr != nil {
+			err = syscall.EIO
+		} else if v.fastWrite != nil {
+			err = v.checkpointFastWrite(ctx, ino)
+		} else {
+			err = h.writer.Flush(ctx)
+		}
 		if err == syscall.ENOENT || err == syscall.EPERM || err == syscall.EINVAL {
 			err = syscall.EBADF
 		}
@@ -1228,14 +1691,24 @@ func (v *VFS) RemoveXattr(ctx Context, ino Ino, name string) (err syscall.Errno)
 var logger = utils.GetLogger("juicefs")
 
 type VFS struct {
-	Conf            *Config
-	Meta            meta.Meta
-	Store           chunk.ChunkStore
-	InvalidateEntry func(parent meta.Ino, name string) syscall.Errno
-	UpdateFormat    func(*meta.Format)
-	reader          DataReader
-	writer          DataWriter
-	cacheFiller     *CacheFiller
+	Conf             *Config
+	Meta             meta.Meta
+	Store            chunk.ChunkStore
+	InvalidateEntry  func(parent meta.Ino, name string) syscall.Errno
+	UpdateFormat     func(*meta.Format)
+	reader           DataReader
+	writer           DataWriter
+	cacheFiller      *CacheFiller
+	fastWrite        *fastWrite
+	fastWriteInitErr error
+	// Serialize destructive namespace changes with local overlay lifecycle
+	// transitions and dynamic trash fail-closed state.
+	fastWriteLifecycleMu  sync.Mutex
+	fastWriteTrashBlocked bool
+	// Inodes unlinked while still open, before a local overlay existed.
+	// O_TMPFILE is the common case: community Create unlinks immediately,
+	// and the first write happens afterwards.
+	fastWritePending sync.Map
 
 	handles   map[Ino][]*handle
 	handleIno map[uint64]Ino
@@ -1251,21 +1724,26 @@ type VFS struct {
 func NewVFS(conf *Config, m meta.Meta, store chunk.ChunkStore, registerer prometheus.Registerer, registry *prometheus.Registry) *VFS {
 	reader := NewDataReader(conf, m, store)
 	writer := NewDataWriter(conf, m, store, reader)
-
-	v := &VFS{
-		Conf:        conf,
-		Meta:        m,
-		Store:       store,
-		reader:      reader,
-		writer:      writer,
-		cacheFiller: NewCacheFiller(conf, m, store),
-		handles:     make(map[Ino][]*handle),
-		handleIno:   make(map[uint64]Ino),
-		modifiedAt:  make(map[meta.Ino]time.Time),
-		nextfh:      1,
-		registry:    registry,
+	fastWrite, fastWriteErr := openFastWrite(conf.FastWriteDir, conf.Format.UUID)
+	if fastWrite != nil {
+		fastWrite.setSyncConcurrency(conf.FastWriteSyncConcurrency)
 	}
 
+	v := &VFS{
+		Conf:             conf,
+		Meta:             m,
+		Store:            store,
+		reader:           reader,
+		writer:           writer,
+		cacheFiller:      NewCacheFiller(conf, m, store),
+		fastWrite:        fastWrite,
+		fastWriteInitErr: fastWriteErr,
+		handles:          make(map[Ino][]*handle),
+		handleIno:        make(map[uint64]Ino),
+		modifiedAt:       make(map[meta.Ino]time.Time),
+		nextfh:           1,
+		registry:         registry,
+	}
 	n := getInternalNode(ConfigInode)
 	v.Conf.Format.RemoveSecret()
 	data, _ := json.MarshalIndent(v.Conf, "", " ")
@@ -1284,20 +1762,120 @@ func NewVFS(conf *Config, m meta.Meta, store chunk.ChunkStore, registerer promet
 	if statePath == "" {
 		statePath = fmt.Sprintf("/tmp/state%d.json", os.Getppid())
 	}
-	if err := v.loadAllHandles(statePath); err != nil && !os.IsNotExist(err) {
-		logger.Errorf("load state from %s: %s", statePath, err)
+	loadHandlesErr := v.loadAllHandles(statePath)
+	if loadHandlesErr != nil && !os.IsNotExist(loadHandlesErr) {
+		logger.Errorf("load state from %s: %s", statePath, loadHandlesErr)
+		if conf.FastWriteDir != "" && v.fastWriteInitErr == nil {
+			v.fastWriteInitErr = fmt.Errorf("load handle state: %w", loadHandlesErr)
+		}
 	}
-	_ = os.Rename(statePath, statePath+".bak")
+	if v.fastWrite != nil && v.fastWriteInitErr == nil {
+		if err := v.fastWrite.reconcileMetadata(m, func(inode Ino) bool {
+			return len(v.findAllHandles(inode)) != 0
+		}); err != nil {
+			_ = v.fastWrite.abort()
+			v.fastWrite = nil
+			v.fastWriteInitErr = err
+		}
+	}
+	if v.fastWriteInitErr != nil && v.fastWrite != nil {
+		_ = v.fastWrite.abort()
+		v.fastWrite = nil
+	}
+	if conf.FastWriteDir == "" || v.fastWriteInitErr == nil {
+		if err := os.Rename(statePath, statePath+".bak"); err != nil && !os.IsNotExist(err) &&
+			conf.FastWriteDir != "" {
+			v.fastWriteInitErr = fmt.Errorf("consume handle state: %w", err)
+			if v.fastWrite != nil {
+				_ = v.fastWrite.abort()
+				v.fastWrite = nil
+			}
+		}
+	}
+	if v.fastWriteInitErr != nil {
+		logger.Errorf("initialize Fast Write %q: %s", conf.FastWriteDir, v.fastWriteInitErr)
+	}
 
 	go v.cleanupModified()
 	initVFSMetrics(v, writer, reader, registerer)
 	return v
 }
 
+// FastWriteInitError reports a startup failure that must abort the mount.
+func (v *VFS) FastWriteInitError() error {
+	return v.fastWriteInitErr
+}
+
 func (v *VFS) invalidateAttr(ino Ino) {
 	v.modM.Lock()
 	v.modifiedAt[ino] = time.Now()
 	v.modM.Unlock()
+}
+
+func (v *VFS) flushFastWriteMetadata(ctx meta.Context, ino Ino) syscall.Errno {
+	if v.fastWrite == nil {
+		return 0
+	}
+	mutation := v.fastWrite.lockExistingMutation(ino)
+	if mutation == nil {
+		return 0
+	}
+	defer mutation.release()
+	return v.flushFastWriteMetadataWithMutation(ctx, mutation)
+}
+
+func (v *VFS) flushFastWriteMetadataWithMutation(ctx meta.Context, mutation *fastWriteMutationGuard) syscall.Errno {
+	file := mutation.file
+	file.Lock()
+	length, epoch, dirty := file.length, file.metadataEpoch, file.metadataDirty
+	if file.deleted || !dirty {
+		v.fastWrite.finishMetadataFlush(file, epoch, false)
+		return 0
+	}
+	var attr Attr
+	errno := v.Meta.Truncate(ctx, file.inode, 1, length, &attr, true)
+	if errno == 0 {
+		errno = v.Meta.SetAttr(ctx, file.inode, meta.SetAttrMtimeNow, 0, &attr)
+	}
+	v.fastWrite.finishMetadataFlush(file, epoch, errno == 0)
+	return errno
+}
+
+func (v *VFS) checkpointFastWrite(ctx meta.Context, ino Ino) syscall.Errno {
+	if v.fastWrite == nil {
+		return 0
+	}
+	mutation := v.fastWrite.lockExistingMutation(ino)
+	if mutation == nil {
+		return 0
+	}
+	defer mutation.release()
+	return v.checkpointFastWriteWithMutation(ctx, mutation)
+}
+
+func (v *VFS) checkpointFastWriteWithMutation(ctx meta.Context, mutation *fastWriteMutationGuard) syscall.Errno {
+	file := mutation.file
+	file.Lock()
+	length, epoch, dirty := file.length, file.metadataEpoch, file.metadataDirty
+	metadataFlushed := false
+	if dirty && !file.deleted {
+		var attr Attr
+		errno := v.Meta.Truncate(ctx, file.inode, 1, length, &attr, true)
+		if errno == 0 {
+			errno = v.Meta.SetAttr(ctx, file.inode, meta.SetAttrMtimeNow, 0, &attr)
+		}
+		if errno != 0 {
+			v.fastWrite.finishMetadataFlush(file, epoch, false)
+			return errno
+		}
+		metadataFlushed = true
+	}
+	if err := v.fastWrite.checkpointLocked(file); err != nil {
+		v.fastWrite.finishMetadataFlush(file, epoch, false)
+		return syscall.EIO
+	}
+	v.fastWrite.finishMetadataFlush(file, epoch, metadataFlushed)
+	return 0
 }
 
 func (v *VFS) ModifiedSince(ino Ino, start time.Time) bool {
@@ -1336,6 +1914,13 @@ func (v *VFS) FlushAll(path string) (err error) {
 	if err != nil {
 		return err
 	}
+	if v.fastWrite != nil {
+		for _, inode := range v.fastWrite.checkpointInodes() {
+			if errno := v.checkpointFastWrite(meta.Background(), inode); errno != 0 {
+				return errno
+			}
+		}
+	}
 	if path == "" {
 		return nil
 	}
@@ -1355,6 +1940,15 @@ func initVFSMetrics(v *VFS, writer DataWriter, reader DataReader, registerer pro
 		return float64(len(v.handles))
 	})
 	_ = registerer.Register(handlersGause)
+	if v.fastWrite != nil {
+		fileCount := func() float64 {
+			return float64(len(v.fastWrite.listInodes()))
+		}
+		_ = registerer.Register(prometheus.NewGaugeFunc(prometheus.GaugeOpts{
+			Name: "fast_write_files",
+			Help: "number of inodes with unpublished Fast Write state.",
+		}, fileCount))
+	}
 	InitMemoryBufferMetrics(writer, reader, registerer)
 }
 

@@ -1038,7 +1038,7 @@ func parseObjOrigSize(key string) int {
 	return l
 }
 
-func (store *cachedStore) uploadStagingFile(key string, stagingPath string) {
+func (store *cachedStore) uploadStagingFile(key string, stagingPath string, force bool) error {
 	store.currentUpload <- struct{}{}
 	defer func() {
 		<-store.currentUpload
@@ -1049,14 +1049,14 @@ func (store *cachedStore) uploadStagingFile(key string, stagingPath string) {
 	store.pendingMutex.Unlock()
 	if !ok {
 		logger.Debugf("Key %s is not needed, drop it", key)
-		return
+		return nil
 	}
 	defer func() {
 		item.uploading.Store(false)
 	}()
 
-	if !store.canUpload() {
-		return
+	if !force && !store.canUpload() {
+		return nil
 	}
 
 	blen := parseObjOrigSize(key)
@@ -1067,7 +1067,7 @@ func (store *cachedStore) uploadStagingFile(key string, stagingPath string) {
 		} else {
 			logger.Debugf("Key %s is not needed, drop it", key)
 		}
-		return
+		return err
 	}
 	block := NewOffPage(blen)
 	_, err = f.ReadAt(block.Data, 0)
@@ -1084,12 +1084,12 @@ func (store *cachedStore) uploadStagingFile(key string, stagingPath string) {
 	if err != nil {
 		block.Release()
 		logger.Errorf("Read staging file %s: %s", stagingPath, err)
-		return
+		return err
 	}
 	if !store.isPendingValid(key) {
 		block.Release()
 		logger.Debugf("Key %s is not needed, drop it", key)
-		return
+		return nil
 	}
 	ctx := context.WithValue(context.Background(), object.TierKey{}, tierID)
 	store.stageBlockDelay.Add(time.Since(item.ts).Seconds())
@@ -1105,6 +1105,7 @@ func (store *cachedStore) uploadStagingFile(key string, stagingPath string) {
 			}
 		}
 	}
+	return err
 }
 
 func (store *cachedStore) addDelayedStaging(key, stagingPath string, added time.Time, force bool) bool {
@@ -1161,8 +1162,52 @@ func (store *cachedStore) scanDelayedStaging() {
 
 func (store *cachedStore) uploader() {
 	for it := range store.pendingCh {
-		store.uploadStagingFile(it.key, it.fpath)
+		_ = store.uploadStagingFile(it.key, it.fpath, false)
 	}
+}
+
+// FlushStagingSlice force-uploads all staged blocks for a slice before Fast
+// Write publishes the slice metadata.
+func (store *cachedStore) FlushStagingSlice(id uint64, size int) error {
+	if size <= 0 {
+		return nil
+	}
+	slice := sliceForRead(id, size, store)
+	blocks := (size + store.conf.BlockSize - 1) / store.conf.BlockSize
+	for index := 0; index < blocks; index++ {
+		key := slice.key(index)
+		deadline := time.Now().Add(max(store.conf.PutTimeout*2, time.Minute))
+		for {
+			store.pendingMutex.Lock()
+			item := store.pendingKeys[key]
+			store.pendingMutex.Unlock()
+			if item == nil {
+				headTimeout := store.conf.PutTimeout
+				if headTimeout <= 0 {
+					headTimeout = time.Minute
+				}
+				ctx, cancel := context.WithTimeout(context.Background(), headTimeout)
+				_, err := store.storage.Head(ctx, key)
+				cancel()
+				if err == nil {
+					break
+				}
+				if time.Now().After(deadline) {
+					return fmt.Errorf("staging block %s did not become pending", key)
+				}
+				time.Sleep(time.Millisecond * 10)
+				continue
+			}
+			if item.uploading.CompareAndSwap(false, true) {
+				if err := store.uploadStagingFile(item.key, item.fpath, true); err != nil {
+					return err
+				}
+				break
+			}
+			time.Sleep(time.Millisecond * 100)
+		}
+	}
+	return nil
 }
 
 func (store *cachedStore) canUpload() bool {

@@ -341,6 +341,11 @@ func (v *VFS) dumpAllHandles(path string) (err error) {
 			} else if h.reader != nil {
 				length = h.reader.GetLength()
 			}
+			if v.fastWrite != nil {
+				if fastWriteLength, ok := v.fastWrite.Length(ino); ok {
+					length = fastWriteLength
+				}
+			}
 			s := saveHandle{
 				Inode:      uint64(h.inode),
 				Length:     length,

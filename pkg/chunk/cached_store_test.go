@@ -373,6 +373,112 @@ func TestStoreDelayed(t *testing.T) {
 	}
 }
 
+func TestFlushStagingSlice(t *testing.T) {
+	mem, _ := object.CreateStorage("mem", "", "", "", "")
+	conf := defaultConf
+	conf.CacheDir = filepath.Join(os.TempDir(), fmt.Sprintf("diskCache-flush-%d", time.Now().UnixNano()))
+	defer os.RemoveAll(conf.CacheDir)
+	conf.Writeback = true
+	conf.WritebackThresholdSize = conf.BlockSize * 2
+	conf.UploadDelay = time.Hour
+	store := NewCachedStore(mem, conf, nil)
+	writer := store.NewWriter(1234, 0)
+	writer.SetWriteback(true)
+	data := []byte("overlay staging")
+	if _, err := writer.WriteAt(data, 0); err != nil {
+		t.Fatalf("write staged slice: %s", err)
+	}
+	if err := writer.Finish(len(data)); err != nil {
+		t.Fatalf("finish staged slice: %s", err)
+	}
+	key := "chunks/0/1/1234_0_15"
+	if _, err := mem.Head(ctx, key); err == nil {
+		t.Fatalf("staged slice uploaded before forced flush")
+	}
+	if err := store.(*cachedStore).FlushStagingSlice(1234, len(data)); err != nil {
+		t.Fatalf("force staged slice upload: %s", err)
+	}
+	if _, err := mem.Head(ctx, key); err != nil {
+		t.Fatalf("head forced staged slice: %s", err)
+	}
+}
+
+type failingPutStore struct {
+	object.ObjectStorage
+	fail atomic.Bool
+}
+
+func (s *failingPutStore) Put(ctx context.Context, key string, in io.Reader, getters ...object.AttrGetter) error {
+	if s.fail.Load() {
+		return errors.New("injected put failure")
+	}
+	return s.ObjectStorage.Put(ctx, key, in, getters...)
+}
+
+type timeoutThenHeadStore struct {
+	object.ObjectStorage
+	calls atomic.Int32
+}
+
+func (s *timeoutThenHeadStore) Head(ctx context.Context, key string) (object.Object, error) {
+	if s.calls.Add(1) == 1 {
+		<-ctx.Done()
+		return nil, ctx.Err()
+	}
+	return s.ObjectStorage.Head(ctx, key)
+}
+
+func TestFlushStagingSliceCanRetry(t *testing.T) {
+	mem, _ := object.CreateStorage("mem", "", "", "", "")
+	storage := &failingPutStore{ObjectStorage: mem}
+	storage.fail.Store(true)
+	conf := defaultConf
+	conf.CacheDir = filepath.Join(os.TempDir(), fmt.Sprintf("diskCache-flush-retry-%d", time.Now().UnixNano()))
+	defer os.RemoveAll(conf.CacheDir)
+	conf.Writeback = true
+	conf.WritebackThresholdSize = conf.BlockSize * 2
+	conf.UploadDelay = time.Hour
+	store := NewCachedStore(storage, conf, nil)
+	writer := store.NewWriter(1235, 0)
+	writer.SetWriteback(true)
+	data := []byte("retry staging")
+	_, err := writer.WriteAt(data, 0)
+	require.NoError(t, err)
+	require.NoError(t, writer.Finish(len(data)))
+
+	require.Error(t, store.(*cachedStore).FlushStagingSlice(1235, len(data)))
+	storage.fail.Store(false)
+	require.NoError(t, store.(*cachedStore).FlushStagingSlice(1235, len(data)))
+	_, err = mem.Head(ctx, "chunks/0/1/1235_0_13")
+	require.NoError(t, err)
+}
+
+func TestFlushStagingSliceHeadHonorsPutTimeout(t *testing.T) {
+	mem, err := object.CreateStorage("mem", "", "", "", "")
+	require.NoError(t, err)
+	const key = "chunks/0/1/1236_0_7"
+	require.NoError(t, mem.Put(context.Background(), key, bytes.NewReader([]byte("present"))))
+	storage := &timeoutThenHeadStore{ObjectStorage: mem}
+	conf := defaultConf
+	conf.PutTimeout = 20 * time.Millisecond
+	store := &cachedStore{
+		storage:       storage,
+		conf:          conf,
+		pendingKeys:   make(map[string]*pendingItem),
+		currentUpload: make(chan struct{}, 1),
+	}
+
+	done := make(chan error, 1)
+	go func() { done <- store.FlushStagingSlice(1236, len("present")) }()
+	select {
+	case err = <-done:
+		require.NoError(t, err)
+	case <-time.After(time.Second):
+		t.Fatal("FlushStagingSlice did not cancel a blocked Head request")
+	}
+	require.GreaterOrEqual(t, storage.calls.Load(), int32(2))
+}
+
 func TestStoreMultiBuckets(t *testing.T) {
 	mem, _ := object.CreateStorage("mem", "", "", "", "")
 	conf := defaultConf

@@ -22,6 +22,12 @@ import (
 	"testing"
 )
 
+func TestFastWriteControlCommandID(t *testing.T) {
+	if UploadFastWrite != 0xF0000001 {
+		t.Fatalf("unexpected Fast Write control command ID: %#x", UploadFastWrite)
+	}
+}
+
 func Test_injectPasswordIntoURI(t *testing.T) {
 	const dbPasswd = "dbPasswd"
 	tests := []struct {
