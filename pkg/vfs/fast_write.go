@@ -1418,6 +1418,37 @@ func (o *fastWrite) Read(inode Ino, off uint64, dst []byte, remote fastWriteRemo
 	return read, 0
 }
 
+// LocalPagesInRange reports whether any page covering [off, off+length) is
+// still served by a local generation.
+//
+// A range whose pages are all published can be copied as metadata alone. The
+// caller must check this for the destination too: local pages win over remote
+// slices on read, so sharing remote slices underneath a local page would make
+// the copy silently return the destination's old bytes.
+func (o *fastWrite) LocalPagesInRange(inode Ino, off, length uint64) bool {
+	if length == 0 {
+		return false
+	}
+	file := o.get(inode)
+	if file == nil {
+		return false
+	}
+	file.RLock()
+	defer file.RUnlock()
+	end := off + length
+	if end < off {
+		end = ^uint64(0)
+	}
+	for absolute := off / fastWritePageSize * fastWritePageSize; absolute < end; absolute += fastWritePageSize {
+		chunkIndex := uint32(absolute / meta.ChunkSize)
+		page := uint32((absolute % meta.ChunkSize) / fastWritePageSize)
+		if generation, _ := fastWritePageSourceLocked(file, chunkIndex, page); generation != nil {
+			return true
+		}
+	}
+	return false
+}
+
 func (o *fastWrite) Length(inode Ino) (uint64, bool) {
 	file := o.get(inode)
 	if file == nil {
@@ -2174,24 +2205,50 @@ func fastWriteFileCleanLocked(file *fastWriteFile) bool {
 	return true
 }
 
-func (o *fastWrite) localPageSource(inode Ino, absolute uint64) (string, uint64, bool) {
+// localPageRun returns the longest run of whole pages starting at the source
+// offset srcPos that can be cloned with a single reflink. dstPos and limit
+// bound the run: it never crosses the destination chunk boundary nor exceeds
+// the remaining copy size.
+//
+// Every page of a run must be served by the same local generation, so the run
+// maps to one contiguous range of one chunk file. Cloning per page instead
+// would issue one FICLONERANGE per 4 KiB — 262,144 ioctls for a 1 GiB image.
+func (o *fastWrite) localPageRun(inode Ino, srcPos, dstPos, limit uint64) (string, uint64, uint32, bool) {
 	file := o.get(inode)
 	if file == nil {
-		return "", 0, false
+		return "", 0, 0, false
 	}
 	file.RLock()
 	defer file.RUnlock()
-	chunkIndex := uint32(absolute / meta.ChunkSize)
-	page := uint32((absolute % meta.ChunkSize) / fastWritePageSize)
+	chunkIndex := uint32(srcPos / meta.ChunkSize)
+	page := uint32((srcPos % meta.ChunkSize) / fastWritePageSize)
 	generation, _ := fastWritePageSourceLocked(file, chunkIndex, page)
 	if generation == nil {
-		return "", 0, false
+		return "", 0, 0, false
 	}
-	return o.dataPath(inode, generation.ID, chunkIndex), uint64(page) * fastWritePageSize, true
+	// A chunk file holds one generation's pages, so a run stops at the end of
+	// either chunk, and the destination has to stay inside a single chunk for
+	// its bitmap update to cover the same pages.
+	pages := fastWritePagesPerChunk - page
+	if room := fastWritePagesPerChunk - uint32((dstPos%meta.ChunkSize)/fastWritePageSize); room < pages {
+		pages = room
+	}
+	if remaining := uint32(limit / fastWritePageSize); remaining < pages {
+		pages = remaining
+	}
+	run := uint32(1)
+	for run < pages {
+		next, _ := fastWritePageSourceLocked(file, chunkIndex, page+run)
+		if next == nil || next.ID != generation.ID {
+			break
+		}
+		run++
+	}
+	return o.dataPath(inode, generation.ID, chunkIndex), uint64(page) * fastWritePageSize, run, true
 }
 
-func (o *fastWrite) clonePageWithMutation(mutation *fastWriteMutationGuard, dstOff uint64,
-	srcPath string, srcOff uint64) (bool, syscall.Errno) {
+func (o *fastWrite) cloneRunWithMutation(mutation *fastWriteMutationGuard, dstOff uint64,
+	srcPath string, srcOff uint64, pages uint32) (bool, syscall.Errno) {
 	if mutation == nil || mutation.file == nil {
 		return false, syscall.EINVAL
 	}
@@ -2207,6 +2264,7 @@ func (o *fastWrite) clonePageWithMutation(mutation *fastWriteMutationGuard, dstO
 	}
 	chunkIndex := uint32(dstOff / meta.ChunkSize)
 	page := uint32((dstOff % meta.ChunkSize) / fastWritePageSize)
+	length := uint64(pages) * fastWritePageSize
 	chunk := ensureFastWriteChunk(generation, chunkIndex)
 	key := fastWriteFDKey{file.inode, generation.ID, chunkIndex}
 	dstFile, err := o.getFD(key, true)
@@ -2219,13 +2277,15 @@ func (o *fastWrite) clonePageWithMutation(mutation *fastWriteMutationGuard, dstO
 		return false, 0
 	}
 	defer srcFile.Close()
-	if err = cloneFileRange(int(dstFile.Fd()), int(srcFile.Fd()), srcOff, uint64(page)*fastWritePageSize, fastWritePageSize); err != nil {
+	if err = o.cloneRange(int(dstFile.Fd()), int(srcFile.Fd()), srcOff, uint64(page)*fastWritePageSize, length); err != nil {
 		return false, 0
 	}
-	bitmapSet(chunk.Bitmap, page)
+	for offset := uint32(0); offset < pages; offset++ {
+		bitmapSet(chunk.Bitmap, page+offset)
+	}
 	o.markFDDirty(key)
-	if dstOff+fastWritePageSize > file.length {
-		file.length = dstOff + fastWritePageSize
+	if dstOff+length > file.length {
+		file.length = dstOff + length
 	}
 	markFastWriteMutationLocked(file)
 	return true, 0
@@ -2250,14 +2310,14 @@ func (o *fastWrite) copyRangeWithMutation(mutation *fastWriteMutationGuard, src 
 		srcPos, dstPos := offIn+copied, offOut+copied
 		n := min(size-copied, fastWritePageSize-srcPos%fastWritePageSize, fastWritePageSize-dstPos%fastWritePageSize)
 		if n == fastWritePageSize {
-			path, localOff, local := o.localPageSource(src, srcPos)
+			path, localOff, pages, local := o.localPageRun(src, srcPos, dstPos, size-copied)
 			if local {
-				cloned, errno := o.clonePageWithMutation(mutation, dstPos, path, localOff)
+				cloned, errno := o.cloneRunWithMutation(mutation, dstPos, path, localOff, pages)
 				if errno != 0 {
 					return copied, errno
 				}
 				if cloned {
-					copied += n
+					copied += uint64(pages) * fastWritePageSize
 					continue
 				}
 			}

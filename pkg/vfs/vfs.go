@@ -1384,6 +1384,36 @@ func (v *VFS) CopyFileRange(ctx Context, nodeIn Ino, fhIn, offIn uint64, nodeOut
 		}
 		defer mutation.release()
 		originalDstLength := mutation.originalLength
+		// When neither side of the range is served by a local generation, the
+		// data is already in the object store: reference the source's slices
+		// from the destination instead of copying pages into its overlay. This is
+		// the common case for template start and snapshot, where the source was
+		// published before the copy.
+		if !v.fastWrite.LocalPagesInRange(nodeIn, offIn, logicalSize) &&
+			!v.fastWrite.LocalPagesInRange(nodeOut, offOut, logicalSize) {
+			if err = v.writer.Flush(ctx, nodeIn); err != 0 {
+				return
+			}
+			if err = v.writer.Flush(ctx, nodeOut); err != 0 {
+				return
+			}
+			var length uint64
+			err = v.Meta.CopyFileRange(ctx, nodeIn, offIn, nodeOut, offOut, logicalSize,
+				flags, &copied, &length)
+			if err == 0 {
+				v.writer.Truncate(nodeOut, length)
+				// The destination now serves these pages from the source's
+				// remote slices, but fastWrite.Read clamps reads to the overlay
+				// length: without growing it, the copied range would read back
+				// as whatever the destination held before (usually nothing).
+				mutation.file.Lock()
+				growFastWriteFileLocked(mutation.file, length)
+				mutation.file.Unlock()
+				v.reader.Invalidate(nodeOut, offOut, copied)
+				v.invalidateAttr(nodeOut)
+			}
+			return
+		}
 		requestedEnd := offOut + logicalSize
 		if requestedEnd > originalDstLength {
 			var attr Attr

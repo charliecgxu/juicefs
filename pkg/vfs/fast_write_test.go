@@ -2560,11 +2560,19 @@ func TestVFSFastWriteCopyRangeRestoresCommittedLength(t *testing.T) {
 	require.Zero(t, errno)
 	sourceData := bytes.Repeat([]byte{'s'}, int(fastWritePageSize*2))
 	require.Zero(t, v.Write(ctx, source.Inode, sourceData, 0, sourceFH))
-	require.Zero(t, v.uploadFastWriteInode(ctx, source.Inode, &UploadFastWriteResponse{}))
+	// Keep the source pages local: a published source is copied by metadata
+	// alone (see TestVFSFastWriteCopyRangePublishedUsesMetadata), which never
+	// reaches the write path these cases inject failures into.
 
 	t.Run("zero bytes", func(t *testing.T) {
 		target, targetFH, createErrno := v.Create(ctx, meta.RootInode, "fast-write-copy-zero", 0644, 0, syscall.O_RDWR)
 		require.Zero(t, createErrno)
+		// Fail the clone so the copy falls back to the write path this case
+		// injects into.
+		fastWrite.cloneRangeHook = func(_, _ int, _, _, _ uint64) error {
+			return syscall.EOPNOTSUPP
+		}
+		defer func() { fastWrite.cloneRangeHook = nil }()
 		fastWrite.writeFileHook = func(*os.File, []byte, int64) (int, error) {
 			return 0, syscall.ENOSPC
 		}
@@ -2580,6 +2588,10 @@ func TestVFSFastWriteCopyRangeRestoresCommittedLength(t *testing.T) {
 	t.Run("one page", func(t *testing.T) {
 		target, targetFH, createErrno := v.Create(ctx, meta.RootInode, "fast-write-copy-partial", 0644, 0, syscall.O_RDWR)
 		require.Zero(t, createErrno)
+		fastWrite.cloneRangeHook = func(_, _ int, _, _, _ uint64) error {
+			return syscall.EOPNOTSUPP
+		}
+		defer func() { fastWrite.cloneRangeHook = nil }()
 		fastWrite.writeFileHook = func(file *os.File, data []byte, off int64) (int, error) {
 			written, writeErr := writeFullAtCount(file, data[:fastWritePageSize], off)
 			if writeErr != nil {
@@ -2596,6 +2608,56 @@ func TestVFSFastWriteCopyRangeRestoresCommittedLength(t *testing.T) {
 		require.Equal(t, fastWritePageSize*3, attr.Length)
 	})
 	fastWrite.writeFileHook = nil
+}
+
+func TestVFSFastWriteCopyRangePublishedUsesMetadata(t *testing.T) {
+	v, _ := createTestVFS(nil, "")
+	fastWrite, err := openFastWrite(t.TempDir())
+	require.NoError(t, err)
+	defer fastWrite.close()
+	v.fastWrite = fastWrite
+	v.Conf.FastWriteDir = fastWrite.root
+	ctx := NewLogContext(meta.NewContext(141, 0, []uint32{0}))
+
+	source, sourceFH, errno := v.Create(ctx, meta.RootInode, "fast-write-published-copy-source", 0644, 0, syscall.O_RDWR)
+	require.Zero(t, errno)
+	sourceData := bytes.Repeat([]byte{'p'}, int(fastWritePageSize*2))
+	require.Zero(t, v.Write(ctx, source.Inode, sourceData, 0, sourceFH))
+	require.Zero(t, v.uploadFastWriteInode(ctx, source.Inode, &UploadFastWriteResponse{}))
+
+	target, targetFH, errno := v.Create(ctx, meta.RootInode, "fast-write-published-copy-target", 0644, 0, syscall.O_RDWR)
+	require.Zero(t, errno)
+
+	// A published source must not be cloned page by page into the destination
+	// overlay: that copy is metadata-only, so no write may reach the overlay.
+	var writes atomic.Int32
+	fastWrite.writeFileHook = func(file *os.File, data []byte, off int64) (int, error) {
+		writes.Add(1)
+		return writeFullAtCount(file, data, off)
+	}
+	defer func() { fastWrite.writeFileHook = nil }()
+
+	copied, copyErrno := v.CopyFileRange(ctx, source.Inode, sourceFH, 0,
+		target.Inode, targetFH, 0, uint64(len(sourceData)), 0)
+	require.Zero(t, copyErrno)
+	require.Equal(t, uint64(len(sourceData)), copied)
+	require.Zero(t, writes.Load(), "published source copy must not write page data")
+
+	// The destination must serve the copied range from the source's slices, so
+	// the read-side overlay length has to cover it.
+	length, ok := fastWrite.Length(target.Inode)
+	require.True(t, ok)
+	require.Equal(t, uint64(len(sourceData)), length)
+
+	var attr Attr
+	require.Zero(t, v.Meta.GetAttr(ctx, target.Inode, &attr))
+	require.Equal(t, uint64(len(sourceData)), attr.Length)
+
+	got := make([]byte, len(sourceData))
+	n, errno := v.Read(ctx, target.Inode, got, 0, targetFH)
+	require.Zero(t, errno)
+	require.Equal(t, len(got), n)
+	require.Equal(t, sourceData, got)
 }
 
 func TestVFSFastWriteCopyRangeZeroLengthIsNoop(t *testing.T) {
@@ -2758,7 +2820,8 @@ func TestVFSFastWriteCopyRangeSerializesConcurrentWriter(t *testing.T) {
 	require.Zero(t, errno)
 	page := bytes.Repeat([]byte{'c'}, int(fastWritePageSize))
 	require.Zero(t, v.Write(copyCtx, source.Inode, page, 0, sourceFH))
-	require.Zero(t, v.uploadFastWriteInode(copyCtx, source.Inode, &UploadFastWriteResponse{}))
+	// Keep the source page local so the copy takes the clone path guarded by
+	// the destination mutation lock; a published source is copied by metadata.
 
 	target, targetFH, errno := v.Create(copyCtx, meta.RootInode, "fast-write-concurrent-copy-target",
 		0644, 0, syscall.O_RDWR)
@@ -2769,6 +2832,10 @@ func TestVFSFastWriteCopyRangeSerializesConcurrentWriter(t *testing.T) {
 	started := make(chan struct{})
 	release := make(chan struct{})
 	var calls atomic.Int32
+	fastWrite.cloneRangeHook = func(_, _ int, _, _, _ uint64) error {
+		return syscall.EOPNOTSUPP
+	}
+	defer func() { fastWrite.cloneRangeHook = nil }()
 	fastWrite.writeFileHook = func(file *os.File, data []byte, off int64) (int, error) {
 		if calls.Add(1) == 1 {
 			close(started)
