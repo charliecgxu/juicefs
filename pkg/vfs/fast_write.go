@@ -2304,10 +2304,13 @@ func (o *fastWrite) cloneFastWriteSpan(mutation *fastWriteMutationGuard, srcPath
 	// Chunk files are fixed size, so the span never runs past EOF even when its
 	// tail is a hole. Reflink the whole span and let the bitmap decide which
 	// pages keep the cloned data.
+	cloneStart := time.Now()
 	if err = o.cloneRange(int(dstFile.Fd()), int(srcFile.Fd()), srcChunkOff,
 		dstOff%meta.ChunkSize, length); err != nil {
+		logger.Debugf("copy_file_range: reflink FAILED src=%s srcOff=%d dstOff=%d len=%d pages=%d err=%v", srcPath, srcChunkOff, dstOff%meta.ChunkSize, length, pages, err)
 		return false, 0
 	}
+	logger.Debugf("copy_file_range: reflink OK src=%s srcOff=%d dstOff=%d len=%d pages=%d dur=%s", srcPath, srcChunkOff, dstOff%meta.ChunkSize, length, pages, time.Since(cloneStart))
 	for i := uint32(0); i < pages; i++ {
 		if local[i] {
 			bitmapSet(chunk.Bitmap, firstPage+i)
@@ -2384,6 +2387,8 @@ func (o *fastWrite) copyRangeWithMutation(mutation *fastWriteMutationGuard, src 
 	buffer := make([]byte, fastWritePageSize)
 	var fallback []byte
 	paths := make(map[fastWriteFDKey]string)
+	var reflinkCalls, reflinkOK, fallbackPages, remotePages int
+	spanStart := time.Now()
 	for copied < size {
 		srcPos, dstPos := offIn+copied, offOut+copied
 		n := min(size-copied, fastWritePageSize-srcPos%fastWritePageSize, fastWritePageSize-dstPos%fastWritePageSize)
@@ -2414,11 +2419,13 @@ func (o *fastWrite) copyRangeWithMutation(mutation *fastWriteMutationGuard, src 
 			}
 			if owner != nil && !mixed {
 				path := o.cachedDataPath(paths, src, owner.ID, chunkIndex)
+				reflinkCalls++
 				cloned, errno := o.cloneFastWriteSpan(mutation, path, srcPos, dstPos, pages, local)
 				if errno != 0 {
 					return copied, errno
 				}
 				if cloned {
+					reflinkOK++
 					copied += uint64(pages) * fastWritePageSize
 					continue
 				}
@@ -2437,6 +2444,7 @@ func (o *fastWrite) copyRangeWithMutation(mutation *fastWriteMutationGuard, src 
 					if errno := o.clearFastWritePages(mutation, dstSpan, span); errno != 0 {
 						return copied, errno
 					}
+					remotePages += int(span)
 					copied += uint64(span) * fastWritePageSize
 					page += span
 					continue
@@ -2446,17 +2454,21 @@ func (o *fastWrite) copyRangeWithMutation(mutation *fastWriteMutationGuard, src 
 					spanLocal[i] = true
 				}
 				path := o.cachedDataPath(paths, src, generation.ID, chunkIndex)
+				reflinkCalls++
 				cloned, errno := o.cloneFastWriteSpan(mutation, path, srcSpan, dstSpan, span, spanLocal)
 				if errno != 0 {
 					return copied, errno
 				}
 				if cloned {
+					reflinkOK++
 					copied += uint64(span) * fastWritePageSize
 					page += span
 					continue
 				}
 				// Reflink is unavailable: copy this span in blocks through a
 				// reused buffer instead of reopening every page.
+				fallbackPages += int(span)
+				fbStart := time.Now()
 				for done := uint64(0); done < uint64(span)*fastWritePageSize; {
 					blockLen := min(uint64(span)*fastWritePageSize-done, fastWriteCopyBlockSize)
 					if cap(fallback) < int(blockLen) {
@@ -2479,6 +2491,7 @@ func (o *fastWrite) copyRangeWithMutation(mutation *fastWriteMutationGuard, src 
 					}
 					done += uint64(len(data))
 				}
+				logger.Debugf("copy_file_range: fallback buffered copy span=%d pages dur=%s", span, time.Since(fbStart))
 				page += span
 			}
 			continue
@@ -2494,6 +2507,8 @@ func (o *fastWrite) copyRangeWithMutation(mutation *fastWriteMutationGuard, src 
 			return copied, errno
 		}
 	}
+	logger.Debugf("copy_file_range: copyRangeWithMutation done src=%d size=%d copied=%d reflinkCalls=%d reflinkOK=%d fallbackPages=%d remotePages=%d dur=%s",
+		src, size, copied, reflinkCalls, reflinkOK, fallbackPages, remotePages, time.Since(spanStart))
 	return copied, 0
 }
 

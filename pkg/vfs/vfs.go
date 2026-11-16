@@ -1328,6 +1328,7 @@ func (v *VFS) CopyFileRange(ctx Context, nodeIn Ino, fhIn, offIn uint64, nodeOut
 		return 0, syscall.EIO
 	}
 	if v.fastWrite != nil {
+		cfrStart := time.Now()
 		srcLength := hi.reader.GetLength()
 		if length, ok := v.fastWrite.Length(nodeIn); ok && length > srcLength {
 			srcLength = length
@@ -1359,20 +1360,29 @@ func (v *VFS) CopyFileRange(ctx Context, nodeIn Ino, fhIn, offIn uint64, nodeOut
 		}
 		defer mutation.release()
 		originalDstLength := mutation.originalLength
+		srcLocal := v.fastWrite.LocalPagesInRange(nodeIn, offIn, logicalSize)
+		dstLocal := v.fastWrite.LocalPagesInRange(nodeOut, offOut, logicalSize)
+		logger.Debugf("copy_file_range: src=%d off=%d dst=%d dstOff=%d size=%d srcLen=%d dstLen=%d srcLocal=%v dstLocal=%v",
+			nodeIn, offIn, nodeOut, offOut, logicalSize, remoteSrcAttr.Length, remoteDstAttr.Length, srcLocal, dstLocal)
 		// Published ranges have no local pages. Reference the source slices
 		// and return; walking them would copy object-store data into the
 		// destination overlay. fastWrite.Read clamps to the overlay length,
 		// so that length has to grow with the committed inode.
-		if !v.fastWrite.LocalPagesInRange(nodeIn, offIn, logicalSize) &&
-			!v.fastWrite.LocalPagesInRange(nodeOut, offOut, logicalSize) {
+		if !srcLocal && !dstLocal {
+			flushStart := time.Now()
 			if err = v.writer.Flush(ctx, nodeIn); err != 0 {
 				return 0, err
 			}
 			if err = v.writer.Flush(ctx, nodeOut); err != 0 {
 				return 0, err
 			}
+			flushDur := time.Since(flushStart)
+			metaStart := time.Now()
 			var length uint64
 			err = v.Meta.CopyFileRange(ctx, nodeIn, offIn, nodeOut, offOut, logicalSize, flags, &copied, &length)
+			metaDur := time.Since(metaStart)
+			logger.Debugf("copy_file_range: metadata-only path src=%d dst=%d copied=%d len=%d flush=%s meta=%s total=%s",
+				nodeIn, nodeOut, copied, length, flushDur, metaDur, time.Since(cfrStart))
 			if err != 0 {
 				return 0, err
 			}
@@ -1440,6 +1450,8 @@ func (v *VFS) CopyFileRange(ctx Context, nodeIn Ino, fhIn, offIn uint64, nodeOut
 		if copied > 0 || requestedEnd > originalDstLength {
 			v.invalidateAttr(nodeOut)
 		}
+		logger.Debugf("copy_file_range: local clone path src=%d dst=%d copied=%d/%d total=%s",
+			nodeIn, nodeOut, copied, logicalSize, time.Since(cfrStart))
 		return
 	}
 	err = v.writer.Flush(ctx, nodeIn)
