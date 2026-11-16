@@ -676,37 +676,49 @@ func TestFastWriteCopyRangeIsIndependent(t *testing.T) {
 	require.Equal(t, source, got)
 }
 
-func TestFastWriteCopyRangeClonesPerPageRun(t *testing.T) {
+func TestFastWriteCopyRangeClonesWholeSpanOnce(t *testing.T) {
 	fastWrite, err := openFastWrite(t.TempDir())
 	require.NoError(t, err)
 	defer fastWrite.close()
-	remote := fastWriteTestRemote(nil)
-	const pages = 4
-	content := make([]byte, int(fastWritePageSize)*pages)
-	for i := range content {
-		content[i] = byte(i * 7)
-	}
-	require.Zero(t, fastWrite.Write(70, uint64(len(content)), 0, content, remote))
+	// Page 0 and 2 are local, page 1 and 3 are remote. The reflink still covers
+	// all four pages; the bitmap decides which ones stay local.
+	remoteData := bytes.Repeat([]byte{'r'}, int(fastWritePageSize*4))
+	remote := fastWriteTestRemote(remoteData)
+	localA := bytes.Repeat([]byte{'a'}, int(fastWritePageSize))
+	localC := bytes.Repeat([]byte{'c'}, int(fastWritePageSize))
+	require.Zero(t, fastWrite.Write(70, uint64(len(remoteData)), 0, localA, remote))
+	require.Zero(t, fastWrite.Write(70, uint64(len(remoteData)), fastWritePageSize*2, localC, remote))
 	require.Zero(t, fastWrite.Checkpoint(70))
 
 	var calls []uint64
-	fastWrite.cloneRangeHook = func(dstFD, srcFD int, srcOff, dstOff, length uint64) error {
+	fastWrite.cloneRangeHook = func(_, _ int, _, _, length uint64) error {
 		calls = append(calls, length)
-		return cloneFileRange(dstFD, srcFD, srcOff, dstOff, length)
+		return nil
 	}
-	copied, errno := fastWrite.CopyRange(70, 71, uint64(len(content)), 0, 0, 0, uint64(len(content)), remote, remote)
+	copied, errno := fastWrite.CopyRange(70, 71, uint64(len(remoteData)), 0, 0, 0, uint64(len(remoteData)), remote, remote)
 	require.Zero(t, errno)
-	require.Equal(t, uint64(len(content)), copied)
-	// One reflink for the whole contiguous run, not one per 4 KiB page.
-	require.Equal(t, []uint64{uint64(len(content))}, calls)
+	require.Equal(t, uint64(len(remoteData)), copied)
+	// One reflink for the whole span, even though the bitmap has holes.
+	require.Equal(t, []uint64{uint64(len(remoteData))}, calls)
 
 	fastWrite.cloneRangeHook = nil
 	require.Zero(t, fastWrite.Checkpoint(71))
-	got := make([]byte, len(content))
-	n, errno := fastWrite.Read(71, 0, got, remote)
-	require.Zero(t, errno)
-	require.Equal(t, len(got), n)
-	require.Equal(t, content, got)
+
+	// Without a real reflink the destination pages hold whatever the clone
+	// would have produced; what matters here is that the bitmap keeps the
+	// source's local pages and lets the copied slices show through the holes.
+	file := fastWrite.get(71)
+	require.NotNil(t, file)
+	file.RLock()
+	active := activeGeneration(file)
+	require.NotNil(t, active)
+	chunk := active.Chunks[0]
+	require.NotNil(t, chunk)
+	require.True(t, bitmapGet(chunk.Bitmap, 0))
+	require.False(t, bitmapGet(chunk.Bitmap, 1))
+	require.True(t, bitmapGet(chunk.Bitmap, 2))
+	require.False(t, bitmapGet(chunk.Bitmap, 3))
+	file.RUnlock()
 }
 
 func TestFastWriteCopyRangeSplitsAtPageSourceBoundary(t *testing.T) {
@@ -717,7 +729,7 @@ func TestFastWriteCopyRangeSplitsAtPageSourceBoundary(t *testing.T) {
 	remote := fastWriteTestRemote(nil)
 
 	// First half stays in a renamed generation, the second half is written to
-	// the current file, so one run spans two chunk files.
+	// the current file, so one span spans two chunk files.
 	first := bytes.Repeat([]byte{'a'}, int(fastWritePageSize))
 	second := bytes.Repeat([]byte{'b'}, int(fastWritePageSize))
 	require.Zero(t, fastWrite.Write(72, fastWritePageSize, 0, first, remote))
@@ -2570,6 +2582,62 @@ func TestVFSFastWriteCopyRangeRestoresCommittedLength(t *testing.T) {
 		require.Equal(t, fastWritePageSize*3, attr.Length)
 	})
 	fastWrite.writeFileHook = nil
+}
+
+func TestVFSFastWriteCopyRangePublishedUsesMetadata(t *testing.T) {
+	v, _ := createTestVFS(nil, "")
+	fastWrite, err := openFastWrite(t.TempDir())
+	require.NoError(t, err)
+	defer fastWrite.close()
+	v.fastWrite = fastWrite
+	v.Conf.FastWriteDir = fastWrite.root
+	ctx := NewLogContext(meta.NewContext(141, 0, []uint32{0}))
+
+	source, sourceFH, errno := v.Create(ctx, meta.RootInode, "fast-write-published-copy-source", 0644, 0, syscall.O_RDWR)
+	require.Zero(t, errno)
+	sourceData := bytes.Repeat([]byte{'p'}, int(fastWritePageSize*2))
+	require.Zero(t, v.Write(ctx, source.Inode, sourceData, 0, sourceFH))
+	require.Zero(t, v.uploadFastWriteInode(ctx, source.Inode, &UploadFastWriteResponse{}))
+
+	target, targetFH, errno := v.Create(ctx, meta.RootInode, "fast-write-published-copy-target", 0644, 0, syscall.O_RDWR)
+	require.Zero(t, errno)
+
+	var writes atomic.Int32
+	fastWrite.writeFileHook = func(file *os.File, data []byte, off int64) (int, error) {
+		writes.Add(1)
+		return writeFullAtCount(file, data, off)
+	}
+	var clones atomic.Int32
+	fastWrite.cloneRangeHook = func(_, _ int, _, _, _ uint64) error {
+		clones.Add(1)
+		return nil
+	}
+	defer func() {
+		fastWrite.writeFileHook = nil
+		fastWrite.cloneRangeHook = nil
+	}()
+
+	copied, copyErrno := v.CopyFileRange(ctx, source.Inode, sourceFH, 0,
+		target.Inode, targetFH, 0, uint64(len(sourceData)), 0)
+	require.Zero(t, copyErrno)
+	require.Equal(t, uint64(len(sourceData)), copied)
+	require.Zero(t, writes.Load())
+	require.Zero(t, clones.Load())
+
+	length, ok := fastWrite.Length(target.Inode)
+	require.True(t, ok)
+	require.Equal(t, uint64(len(sourceData)), length)
+	require.False(t, fastWrite.LocalPagesInRange(target.Inode, 0, uint64(len(sourceData))))
+
+	var attr Attr
+	require.Zero(t, v.Meta.GetAttr(ctx, target.Inode, &attr))
+	require.Equal(t, uint64(len(sourceData)), attr.Length)
+
+	got := make([]byte, len(sourceData))
+	n, errno := v.Read(ctx, target.Inode, got, 0, targetFH)
+	require.Zero(t, errno)
+	require.Equal(t, len(got), n)
+	require.Equal(t, sourceData, got)
 }
 
 func TestVFSFastWriteCopyRangeZeroLengthIsNoop(t *testing.T) {

@@ -1359,6 +1359,36 @@ func (v *VFS) CopyFileRange(ctx Context, nodeIn Ino, fhIn, offIn uint64, nodeOut
 		}
 		defer mutation.release()
 		originalDstLength := mutation.originalLength
+		// Published ranges have no local pages. Reference the source slices
+		// and return; walking them would copy object-store data into the
+		// destination overlay. fastWrite.Read clamps to the overlay length,
+		// so that length has to grow with the committed inode.
+		if !v.fastWrite.LocalPagesInRange(nodeIn, offIn, logicalSize) &&
+			!v.fastWrite.LocalPagesInRange(nodeOut, offOut, logicalSize) {
+			if err = v.writer.Flush(ctx, nodeIn); err != 0 {
+				return 0, err
+			}
+			if err = v.writer.Flush(ctx, nodeOut); err != 0 {
+				return 0, err
+			}
+			var length uint64
+			err = v.Meta.CopyFileRange(ctx, nodeIn, offIn, nodeOut, offOut, logicalSize, flags, &copied, &length)
+			if err != 0 {
+				return 0, err
+			}
+			v.writer.Truncate(nodeOut, length)
+			mutation.file.Lock()
+			growFastWriteFileLocked(mutation.file, length)
+			mutation.file.Unlock()
+			if length > 0 {
+				v.reader.Truncate(nodeOut, length)
+			}
+			if copied > 0 {
+				v.reader.Invalidate(nodeOut, offOut, copied)
+			}
+			v.invalidateAttr(nodeOut)
+			return
+		}
 		requestedEnd := offOut + logicalSize
 		var metaCopied, outLength uint64
 		if offIn < remoteSrcAttr.Length {

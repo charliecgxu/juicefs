@@ -114,7 +114,7 @@ best-effort 删除。因此清理中途失败不会让读路径重新依赖一�
 ## copy、truncate 与空洞
 
 - 普通 read/write copy 自动经过合并视图。
-- `copy_file_range` 先复制 inode 长度以内的 slice 引用。对齐的本地页再 reflink 到目标稀疏文件；源没有本地页的位置清掉目标 bitmap。不对齐的头尾按页读写。
+- `copy_file_range`：源和目标范围内都没有本地页时，只复制 slice 引用并推进目标 overlay 长度，不写本地页。任一侧有本地页时，先复制 inode 长度以内的 slice 引用；同一个 chunk 里连续的对齐区间只做一次 reflink，再按源 bitmap 置位或清位。不对齐的头尾按页读写。
 - 文件长度的更新时机与社区一致。`write` 只推进本进程可见的本地长度；`flush`、`fsync` 和 `close` 把这个长度写入 inode，但不提交 slice 或对象。`truncate` 和 `fallocate` 扩容仍在系统调用内更新 inode。upload 前没有其他客户端读写该文件，因此 inode 长度可以先于 slice 生效。
 - 已 unlink 但仍有打开句柄的 inode 在 `flush`、`fsync` 和 `close` 时同样更新仍存在的 inode 长度；inode 已经不存在时只保留本地长度。
 - short write 只把本地长度停在实际写完的位置，inode 长度留到下一次 `flush`、`fsync` 或 `close`。short copy 把 inode 长度收敛到实际复制范围。零长度 `copy_file_range` 不修改长度、mtime 或配额。

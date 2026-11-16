@@ -1435,6 +1435,33 @@ func (o *fastWrite) Read(inode Ino, off uint64, dst []byte, remote fastWriteRemo
 	return read, 0
 }
 
+// LocalPagesInRange reports whether any page in [off, off+length) is served
+// by a local generation. A false result means the range is already in the
+// object store (or is a hole), so copy_file_range can reference slices.
+func (o *fastWrite) LocalPagesInRange(inode Ino, off, length uint64) bool {
+	if length == 0 {
+		return false
+	}
+	file := o.get(inode)
+	if file == nil {
+		return false
+	}
+	file.RLock()
+	defer file.RUnlock()
+	end := off + length
+	if end < off {
+		end = ^uint64(0)
+	}
+	for absolute := off / fastWritePageSize * fastWritePageSize; absolute < end; absolute += fastWritePageSize {
+		chunkIndex := uint32(absolute / meta.ChunkSize)
+		page := uint32((absolute % meta.ChunkSize) / fastWritePageSize)
+		if generation, _ := fastWritePageSourceLocked(file, chunkIndex, page); generation != nil {
+			return true
+		}
+	}
+	return false
+}
+
 func (o *fastWrite) Length(inode Ino) (uint64, bool) {
 	file := o.get(inode)
 	if file == nil {
@@ -2235,12 +2262,17 @@ func (o *fastWrite) pageRunSource(inode Ino, chunkIndex, firstPage, pages uint32
 	return sources
 }
 
-// cloneFastWritePages copies a page-aligned run within one chunk into the
-// destination with a single reflink. It reports false when the filesystem
-// refuses the clone so the caller can fall back to a buffered copy.
-func (o *fastWrite) cloneFastWritePages(mutation *fastWriteMutationGuard, srcPath string,
-	srcOff, dstOff uint64, pages uint32) (bool, syscall.Errno) {
-	if mutation == nil || mutation.file == nil {
+// cloneFastWriteSpan clones one page-aligned span of a chunk file with a
+// single reflink and then applies the source's local-page bitmap to the
+// destination. The reflink covers the whole span even when some pages are not
+// local: their destination bit is cleared so those pages keep reading the
+// slice references copied by Meta.CopyFileRange.
+//
+// It reports false when the filesystem refuses the clone so the caller can
+// fall back to a buffered copy.
+func (o *fastWrite) cloneFastWriteSpan(mutation *fastWriteMutationGuard, srcPath string,
+	srcOff, dstOff uint64, pages uint32, local []bool) (bool, syscall.Errno) {
+	if mutation == nil || mutation.file == nil || len(local) < int(pages) {
 		return false, syscall.EINVAL
 	}
 	file := mutation.file
@@ -2267,13 +2299,21 @@ func (o *fastWrite) cloneFastWritePages(mutation *fastWriteMutationGuard, srcPat
 		return false, 0
 	}
 	defer srcFile.Close()
+	srcChunkOff := srcOff % meta.ChunkSize
 	length := uint64(pages) * fastWritePageSize
-	if err = o.cloneRange(int(dstFile.Fd()), int(srcFile.Fd()), srcOff%meta.ChunkSize,
+	// Chunk files are fixed size, so the span never runs past EOF even when its
+	// tail is a hole. Reflink the whole span and let the bitmap decide which
+	// pages keep the cloned data.
+	if err = o.cloneRange(int(dstFile.Fd()), int(srcFile.Fd()), srcChunkOff,
 		dstOff%meta.ChunkSize, length); err != nil {
 		return false, 0
 	}
 	for i := uint32(0); i < pages; i++ {
-		bitmapSet(chunk.Bitmap, firstPage+i)
+		if local[i] {
+			bitmapSet(chunk.Bitmap, firstPage+i)
+		} else {
+			bitmapClear(chunk.Bitmap, firstPage+i)
+		}
 	}
 	o.markFDDirty(key)
 	if dstOff+length > file.length {
@@ -2284,7 +2324,8 @@ func (o *fastWrite) cloneFastWritePages(mutation *fastWriteMutationGuard, srcPat
 }
 
 // clearFastWritePages drops the local ownership of a page run so the copied
-// slice references become visible again.
+// slice references become visible again. Every generation is cleared: a
+// renamed one still shadows the remote slices on read.
 func (o *fastWrite) clearFastWritePages(mutation *fastWriteMutationGuard, off uint64, pages uint32) syscall.Errno {
 	if mutation == nil || mutation.file == nil {
 		return 0
@@ -2292,20 +2333,19 @@ func (o *fastWrite) clearFastWritePages(mutation *fastWriteMutationGuard, off ui
 	file := mutation.file
 	file.Lock()
 	defer file.Unlock()
-	generation := activeGeneration(file)
-	if generation == nil {
-		return 0
-	}
-	chunk := generation.Chunks[uint32(off/meta.ChunkSize)]
-	if chunk == nil {
-		return 0
-	}
+	chunkIndex := uint32(off / meta.ChunkSize)
 	firstPage := uint32((off % meta.ChunkSize) / fastWritePageSize)
 	changed := false
-	for i := uint32(0); i < pages; i++ {
-		if bitmapGet(chunk.Bitmap, firstPage+i) {
-			bitmapClear(chunk.Bitmap, firstPage+i)
-			changed = true
+	for _, generation := range file.generations {
+		chunk := generation.Chunks[chunkIndex]
+		if chunk == nil {
+			continue
+		}
+		for i := uint32(0); i < pages; i++ {
+			if bitmapGet(chunk.Bitmap, firstPage+i) {
+				bitmapClear(chunk.Bitmap, firstPage+i)
+				changed = true
+			}
 		}
 	}
 	if changed {
@@ -2324,6 +2364,19 @@ func (o *fastWrite) CopyRange(src, dst Ino, srcRemoteLength, dstRemoteLength, of
 	return o.copyRangeWithMutation(mutation, src, srcRemoteLength, offIn, offOut, size, srcRemote, dstRemote)
 }
 
+// cachedDataPath memoizes the chunk file path of one source generation for the
+// duration of a single CopyRange.
+func (o *fastWrite) cachedDataPath(paths map[fastWriteFDKey]string, inode Ino, generation uint64,
+	chunkIndex uint32) string {
+	key := fastWriteFDKey{inode, generation, chunkIndex}
+	if path, ok := paths[key]; ok {
+		return path
+	}
+	path := o.dataPath(inode, generation, chunkIndex)
+	paths[key] = path
+	return path
+}
+
 func (o *fastWrite) copyRangeWithMutation(mutation *fastWriteMutationGuard, src Ino, srcRemoteLength,
 	offIn, offOut, size uint64, srcRemote, dstRemote fastWriteRemoteReader) (uint64, syscall.Errno) {
 	o.growRemoteLength(src, srcRemoteLength)
@@ -2340,52 +2393,83 @@ func (o *fastWrite) copyRangeWithMutation(mutation *fastWriteMutationGuard, src 
 			pages := uint32(min(size-copied, meta.ChunkSize-srcPos%meta.ChunkSize,
 				meta.ChunkSize-dstPos%meta.ChunkSize) / fastWritePageSize)
 			sources := o.pageRunSource(src, chunkIndex, firstPage, pages)
-			for page := uint32(0); page < pages; {
-				generation := sources[page]
-				run := uint32(1)
-				for page+run < pages && sources[page+run] == generation {
-					run++
-				}
-				srcRun := srcPos + uint64(page)*fastWritePageSize
-				dstRun := dstPos + uint64(page)*fastWritePageSize
+			// Common case: every local page of the range lives in the same
+			// chunk file. Reflink that whole range once and then apply the
+			// bitmap, so an interleaved bitmap costs one ioctl instead of one
+			// per run.
+			local := make([]bool, pages)
+			var owner *fastWriteGeneration
+			mixed := false
+			for i, generation := range sources {
 				if generation == nil {
-					if errno := o.clearFastWritePages(mutation, dstRun, run); errno != 0 {
-						return copied, errno
-					}
-					copied += uint64(run) * fastWritePageSize
-					page += run
 					continue
 				}
-				key := fastWriteFDKey{src, generation.ID, chunkIndex}
-				path, ok := paths[key]
-				if !ok {
-					path = o.dataPath(src, generation.ID, chunkIndex)
-					paths[key] = path
+				local[i] = true
+				if owner == nil {
+					owner = generation
+				} else if generation.ID != owner.ID {
+					mixed = true
+					break
 				}
-				cloned, errno := o.cloneFastWritePages(mutation, path, srcRun, dstRun, run)
+			}
+			if owner != nil && !mixed {
+				path := o.cachedDataPath(paths, src, owner.ID, chunkIndex)
+				cloned, errno := o.cloneFastWriteSpan(mutation, path, srcPos, dstPos, pages, local)
 				if errno != 0 {
 					return copied, errno
 				}
 				if cloned {
-					copied += uint64(run) * fastWritePageSize
-					page += run
+					copied += uint64(pages) * fastWritePageSize
 					continue
 				}
-				// Reflink is unavailable: copy this run in blocks through a
+			}
+			// Mixed generations, or the filesystem refused the reflink: handle
+			// one generation span at a time.
+			for page := uint32(0); page < pages; {
+				generation := sources[page]
+				span := uint32(1)
+				for page+span < pages && sources[page+span] == generation {
+					span++
+				}
+				srcSpan := srcPos + uint64(page)*fastWritePageSize
+				dstSpan := dstPos + uint64(page)*fastWritePageSize
+				if generation == nil {
+					if errno := o.clearFastWritePages(mutation, dstSpan, span); errno != 0 {
+						return copied, errno
+					}
+					copied += uint64(span) * fastWritePageSize
+					page += span
+					continue
+				}
+				spanLocal := make([]bool, span)
+				for i := range spanLocal {
+					spanLocal[i] = true
+				}
+				path := o.cachedDataPath(paths, src, generation.ID, chunkIndex)
+				cloned, errno := o.cloneFastWriteSpan(mutation, path, srcSpan, dstSpan, span, spanLocal)
+				if errno != 0 {
+					return copied, errno
+				}
+				if cloned {
+					copied += uint64(span) * fastWritePageSize
+					page += span
+					continue
+				}
+				// Reflink is unavailable: copy this span in blocks through a
 				// reused buffer instead of reopening every page.
-				for done := uint64(0); done < uint64(run)*fastWritePageSize; {
-					blockLen := min(uint64(run)*fastWritePageSize-done, fastWriteCopyBlockSize)
+				for done := uint64(0); done < uint64(span)*fastWritePageSize; {
+					blockLen := min(uint64(span)*fastWritePageSize-done, fastWriteCopyBlockSize)
 					if cap(fallback) < int(blockLen) {
 						fallback = make([]byte, blockLen)
 					}
 					data := fallback[:blockLen]
-					blockSrc := srcRun + done
+					blockSrc := srcSpan + done
 					nread, errno := o.Read(src, blockSrc, data, srcRemote)
 					if errno != 0 {
 						return copied, errno
 					}
 					clear(data[nread:])
-					written, errno := o.writeWithMutation(mutation, dstRun+done, data, dstRemote)
+					written, errno := o.writeWithMutation(mutation, dstSpan+done, data, dstRemote)
 					copied += uint64(written)
 					if errno != 0 {
 						return copied, errno
@@ -2395,7 +2479,7 @@ func (o *fastWrite) copyRangeWithMutation(mutation *fastWriteMutationGuard, src 
 					}
 					done += uint64(len(data))
 				}
-				page += run
+				page += span
 			}
 			continue
 		}
