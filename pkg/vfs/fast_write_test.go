@@ -676,6 +676,68 @@ func TestFastWriteCopyRangeIsIndependent(t *testing.T) {
 	require.Equal(t, source, got)
 }
 
+func TestFastWriteCopyRangeClonesPerPageRun(t *testing.T) {
+	fastWrite, err := openFastWrite(t.TempDir())
+	require.NoError(t, err)
+	defer fastWrite.close()
+	remote := fastWriteTestRemote(nil)
+	const pages = 4
+	content := make([]byte, int(fastWritePageSize)*pages)
+	for i := range content {
+		content[i] = byte(i * 7)
+	}
+	require.Zero(t, fastWrite.Write(70, uint64(len(content)), 0, content, remote))
+	require.Zero(t, fastWrite.Checkpoint(70))
+
+	var calls []uint64
+	fastWrite.cloneRangeHook = func(dstFD, srcFD int, srcOff, dstOff, length uint64) error {
+		calls = append(calls, length)
+		return cloneFileRange(dstFD, srcFD, srcOff, dstOff, length)
+	}
+	copied, errno := fastWrite.CopyRange(70, 71, uint64(len(content)), 0, 0, 0, uint64(len(content)), remote, remote)
+	require.Zero(t, errno)
+	require.Equal(t, uint64(len(content)), copied)
+	// One reflink for the whole contiguous run, not one per 4 KiB page.
+	require.Equal(t, []uint64{uint64(len(content))}, calls)
+
+	fastWrite.cloneRangeHook = nil
+	require.Zero(t, fastWrite.Checkpoint(71))
+	got := make([]byte, len(content))
+	n, errno := fastWrite.Read(71, 0, got, remote)
+	require.Zero(t, errno)
+	require.Equal(t, len(got), n)
+	require.Equal(t, content, got)
+}
+
+func TestFastWriteCopyRangeSplitsAtPageSourceBoundary(t *testing.T) {
+	root := t.TempDir()
+	fastWrite, err := openFastWrite(root)
+	require.NoError(t, err)
+	defer fastWrite.close()
+	remote := fastWriteTestRemote(nil)
+
+	// First half stays in a renamed generation, the second half is written to
+	// the current file, so one run spans two chunk files.
+	first := bytes.Repeat([]byte{'a'}, int(fastWritePageSize))
+	second := bytes.Repeat([]byte{'b'}, int(fastWritePageSize))
+	require.Zero(t, fastWrite.Write(72, fastWritePageSize, 0, first, remote))
+	require.Zero(t, fastWrite.Checkpoint(72))
+	_, errno := fastWrite.Seal(72)
+	require.Zero(t, errno)
+	require.Zero(t, fastWrite.Write(72, fastWritePageSize*2, fastWritePageSize, second, remote))
+	require.Zero(t, fastWrite.Checkpoint(72))
+
+	var lengths []uint64
+	fastWrite.cloneRangeHook = func(_, _ int, _, _, length uint64) error {
+		lengths = append(lengths, length)
+		return nil
+	}
+	copied, errno := fastWrite.CopyRange(72, 73, fastWritePageSize*2, 0, 0, 0, fastWritePageSize*2, remote, remote)
+	require.Zero(t, errno)
+	require.Equal(t, fastWritePageSize*2, copied)
+	require.Equal(t, []uint64{fastWritePageSize, fastWritePageSize}, lengths)
+}
+
 func TestVFSFastWriteUpload(t *testing.T) {
 	v, _ := createTestVFS(nil, "")
 	fastWrite, err := openFastWrite(t.TempDir())
