@@ -48,6 +48,9 @@ const (
 	fastWriteFooterSize    = uint64(4096)
 	// Upper bound for the buffer used when a page run cannot be reflinked.
 	fastWriteCopyBlockSize = uint64(1 << 20)
+	// How many chunk files one copy_file_range reflinks at the same time.
+	// cubecow copies up to 1GiB per call, which is 16 chunks of 64MiB.
+	fastWriteCloneParallel = 16
 	fastWriteChunkFileSize = uint64(meta.ChunkSize) + fastWriteFooterSize
 	fastWriteFDLimit       = 1024
 
@@ -2380,6 +2383,149 @@ func (o *fastWrite) cachedDataPath(paths map[fastWriteFDKey]string, inode Ino, g
 	return path
 }
 
+// fastWriteCloneJob is one page-aligned reflink within a single pair of chunk files.
+type fastWriteCloneJob struct {
+	srcPath        string
+	srcOff, dstOff uint64
+	pages          uint32
+	local          []bool
+}
+
+// nextFastCloneJob plans the next reflink when every local page of this chunk
+// span lives in one generation. Remote-only spans and mixed generations return
+// false so the caller keeps its existing fallback.
+func (o *fastWrite) nextFastCloneJob(src Ino, srcPos, dstPos, remain uint64, paths map[fastWriteFDKey]string) (fastWriteCloneJob, bool) {
+	n := min(remain, fastWritePageSize-srcPos%fastWritePageSize, fastWritePageSize-dstPos%fastWritePageSize)
+	if n != fastWritePageSize {
+		return fastWriteCloneJob{}, false
+	}
+	chunkIndex := uint32(srcPos / meta.ChunkSize)
+	firstPage := uint32((srcPos % meta.ChunkSize) / fastWritePageSize)
+	pages := uint32(min(remain, meta.ChunkSize-srcPos%meta.ChunkSize, meta.ChunkSize-dstPos%meta.ChunkSize) / fastWritePageSize)
+	sources := o.pageRunSource(src, chunkIndex, firstPage, pages)
+	local := make([]bool, pages)
+	var owner *fastWriteGeneration
+	for i, generation := range sources {
+		if generation == nil {
+			continue
+		}
+		local[i] = true
+		if owner == nil {
+			owner = generation
+		} else if generation.ID != owner.ID {
+			return fastWriteCloneJob{}, false
+		}
+	}
+	if owner == nil {
+		return fastWriteCloneJob{}, false
+	}
+	return fastWriteCloneJob{
+		srcPath: o.cachedDataPath(paths, src, owner.ID, chunkIndex),
+		srcOff:  srcPos,
+		dstOff:  dstPos,
+		pages:   pages,
+		local:   local,
+	}, true
+}
+
+// reflinkCloneJob clones one span. The destination bitmap is updated by the caller.
+func (o *fastWrite) reflinkCloneJob(inode Ino, generation uint64, job fastWriteCloneJob) bool {
+	chunkIndex := uint32(job.dstOff / meta.ChunkSize)
+	key := fastWriteFDKey{inode, generation, chunkIndex}
+	dstFile, err := o.getFD(key, true)
+	if err != nil {
+		return false
+	}
+	defer o.releaseFD(key)
+	srcFile, err := os.Open(job.srcPath)
+	if err != nil {
+		return false
+	}
+	defer srcFile.Close()
+	srcChunkOff := job.srcOff % meta.ChunkSize
+	dstChunkOff := job.dstOff % meta.ChunkSize
+	length := uint64(job.pages) * fastWritePageSize
+	cloneStart := time.Now()
+	if err = o.cloneRange(int(dstFile.Fd()), int(srcFile.Fd()), srcChunkOff, dstChunkOff, length); err != nil {
+		logger.Debugf("copy_file_range: reflink FAILED src=%s srcOff=%d dstOff=%d len=%d pages=%d err=%v", job.srcPath, srcChunkOff, dstChunkOff, length, job.pages, err)
+		return false
+	}
+	logger.Debugf("copy_file_range: reflink OK src=%s srcOff=%d dstOff=%d len=%d pages=%d dur=%s", job.srcPath, srcChunkOff, dstChunkOff, length, job.pages, time.Since(cloneStart))
+	return true
+}
+
+// cloneSpansParallel reflinks jobs concurrently. Bitmap updates stay in order:
+// a later chunk is published only when every chunk before it was cloned.
+func (o *fastWrite) cloneSpansParallel(mutation *fastWriteMutationGuard, jobs []fastWriteCloneJob) (uint64, syscall.Errno) {
+	if mutation == nil || mutation.file == nil || len(jobs) == 0 {
+		return 0, syscall.EINVAL
+	}
+	file := mutation.file
+	file.Lock()
+	if err := o.prepareMutationLocked(file); err != nil {
+		file.Unlock()
+		return 0, syscall.EIO
+	}
+	generation := activeGeneration(file)
+	if generation == nil {
+		file.Unlock()
+		return 0, syscall.EIO
+	}
+	generationID := generation.ID
+	for _, job := range jobs {
+		if len(job.local) < int(job.pages) {
+			file.Unlock()
+			return 0, syscall.EINVAL
+		}
+		ensureFastWriteChunk(generation, uint32(job.dstOff/meta.ChunkSize))
+	}
+	file.Unlock()
+
+	ok := make([]bool, len(jobs))
+	var wg sync.WaitGroup
+	start := time.Now()
+	for i := range jobs {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			ok[i] = o.reflinkCloneJob(file.inode, generationID, jobs[i])
+		}(i)
+	}
+	wg.Wait()
+
+	file.Lock()
+	defer file.Unlock()
+	generation = activeGeneration(file)
+	if generation == nil || generation.ID != generationID {
+		return 0, syscall.EIO
+	}
+	var copied uint64
+	for i, job := range jobs {
+		if !ok[i] {
+			break
+		}
+		chunk := ensureFastWriteChunk(generation, uint32(job.dstOff/meta.ChunkSize))
+		firstPage := uint32((job.dstOff % meta.ChunkSize) / fastWritePageSize)
+		for page := uint32(0); page < job.pages; page++ {
+			if job.local[page] {
+				bitmapSet(chunk.Bitmap, firstPage+page)
+			} else {
+				bitmapClear(chunk.Bitmap, firstPage+page)
+			}
+		}
+		o.markFDDirty(fastWriteFDKey{file.inode, generationID, chunk.Index})
+		if end := job.dstOff + uint64(job.pages)*fastWritePageSize; end > file.length {
+			file.length = end
+		}
+		copied += uint64(job.pages) * fastWritePageSize
+	}
+	if copied > 0 {
+		markFastWriteMutationLocked(file)
+	}
+	logger.Debugf("copy_file_range: parallel reflink spans=%d copied=%d dur=%s", len(jobs), copied, time.Since(start))
+	return copied, 0
+}
+
 func (o *fastWrite) copyRangeWithMutation(mutation *fastWriteMutationGuard, src Ino, srcRemoteLength,
 	offIn, offOut, size uint64, srcRemote, dstRemote fastWriteRemoteReader) (uint64, syscall.Errno) {
 	o.growRemoteLength(src, srcRemoteLength)
@@ -2393,6 +2539,45 @@ func (o *fastWrite) copyRangeWithMutation(mutation *fastWriteMutationGuard, src 
 		srcPos, dstPos := offIn+copied, offOut+copied
 		n := min(size-copied, fastWritePageSize-srcPos%fastWritePageSize, fastWritePageSize-dstPos%fastWritePageSize)
 		if n == fastWritePageSize {
+			var jobs []fastWriteCloneJob
+			usedDest := make(map[uint32]struct{}, fastWriteCloneParallel)
+			scan := copied
+			for len(jobs) < fastWriteCloneParallel && scan < size {
+				job, planned := o.nextFastCloneJob(src, offIn+scan, offOut+scan, size-scan, paths)
+				if !planned {
+					break
+				}
+				destChunk := uint32(job.dstOff / meta.ChunkSize)
+				if _, exists := usedDest[destChunk]; exists {
+					break
+				}
+				usedDest[destChunk] = struct{}{}
+				jobs = append(jobs, job)
+				scan += uint64(job.pages) * fastWritePageSize
+			}
+			reflinkRejected := false
+			if len(jobs) > 0 {
+				clonedBytes, errno := o.cloneSpansParallel(mutation, jobs)
+				if errno != 0 {
+					return copied, errno
+				}
+				if clonedBytes == 0 {
+					reflinkRejected = true
+				} else {
+					var used uint64
+					for _, job := range jobs {
+						spanBytes := uint64(job.pages) * fastWritePageSize
+						if used+spanBytes > clonedBytes {
+							break
+						}
+						used += spanBytes
+						reflinkCalls++
+						reflinkOK++
+					}
+					copied += clonedBytes
+					continue
+				}
+			}
 			chunkIndex := uint32(srcPos / meta.ChunkSize)
 			firstPage := uint32((srcPos % meta.ChunkSize) / fastWritePageSize)
 			pages := uint32(min(size-copied, meta.ChunkSize-srcPos%meta.ChunkSize,
@@ -2417,7 +2602,7 @@ func (o *fastWrite) copyRangeWithMutation(mutation *fastWriteMutationGuard, src 
 					break
 				}
 			}
-			if owner != nil && !mixed {
+			if owner != nil && !mixed && !reflinkRejected {
 				path := o.cachedDataPath(paths, src, owner.ID, chunkIndex)
 				reflinkCalls++
 				cloned, errno := o.cloneFastWriteSpan(mutation, path, srcPos, dstPos, pages, local)

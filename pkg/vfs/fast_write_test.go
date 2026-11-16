@@ -721,6 +721,65 @@ func TestFastWriteCopyRangeClonesWholeSpanOnce(t *testing.T) {
 	file.RUnlock()
 }
 
+func TestFastWriteCopyRangeReflinksChunksInParallel(t *testing.T) {
+	fastWrite, err := openFastWrite(t.TempDir())
+	require.NoError(t, err)
+	defer fastWrite.close()
+	remote := fastWriteTestRemote(nil)
+	page := bytes.Repeat([]byte{'p'}, int(fastWritePageSize))
+	require.Zero(t, fastWrite.Write(74, meta.ChunkSize*2, 0, page, remote))
+	require.Zero(t, fastWrite.Write(74, meta.ChunkSize*2, meta.ChunkSize, page, remote))
+
+	var inflight atomic.Int32
+	var peak atomic.Int32
+	release := make(chan struct{})
+	fastWrite.cloneRangeHook = func(_, _ int, _, _, _ uint64) error {
+		n := inflight.Add(1)
+		for {
+			old := peak.Load()
+			if n <= old || peak.CompareAndSwap(old, n) {
+				break
+			}
+		}
+		<-release
+		inflight.Add(-1)
+		return nil
+	}
+	type copyResult struct {
+		copied uint64
+		errno  syscall.Errno
+	}
+	done := make(chan copyResult, 1)
+	go func() {
+		copied, copyErrno := fastWrite.CopyRange(74, 75, meta.ChunkSize*2, 0, 0, 0, meta.ChunkSize*2, remote, remote)
+		done <- copyResult{copied: copied, errno: copyErrno}
+	}()
+	deadline := time.Now().Add(5 * time.Second)
+	for peak.Load() < 2 && time.Now().Before(deadline) {
+		time.Sleep(time.Millisecond)
+	}
+	close(release)
+	select {
+	case result := <-done:
+		require.Zero(t, result.errno)
+		require.Equal(t, uint64(meta.ChunkSize)*2, result.copied)
+	case <-time.After(5 * time.Second):
+		t.Fatal("copy did not finish")
+	}
+	require.GreaterOrEqual(t, peak.Load(), int32(2))
+
+	fastWrite.cloneRangeHook = nil
+	file := fastWrite.get(75)
+	require.NotNil(t, file)
+	file.RLock()
+	active := activeGeneration(file)
+	require.NotNil(t, active)
+	require.True(t, bitmapGet(active.Chunks[0].Bitmap, 0))
+	require.False(t, bitmapGet(active.Chunks[0].Bitmap, 1))
+	require.True(t, bitmapGet(active.Chunks[1].Bitmap, 0))
+	file.RUnlock()
+}
+
 func TestFastWriteCopyRangeSplitsAtPageSourceBoundary(t *testing.T) {
 	root := t.TempDir()
 	fastWrite, err := openFastWrite(root)
