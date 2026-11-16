@@ -3134,6 +3134,13 @@ func (m *redisMeta) doDeleteSustainedInode(ctx Context, sid uint64, inode Ino) e
 			return err
 		}
 		m.parseAttr(a, &attr)
+		if attr.Nlink > 0 {
+			_, err = tx.TxPipelined(ctx, func(pipe redis.Pipeliner) error {
+				pipe.SRem(ctx, m.sustained(sid), strconv.Itoa(int(inode)))
+				return nil
+			})
+			return err
+		}
 		newSpace = -align4K(attr.Length)
 		_, err = tx.TxPipelined(ctx, func(pipe redis.Pipeliner) error {
 			pipe.ZAdd(ctx, m.delfiles(), redis.Z{Score: float64(m.now().Unix()), Member: m.toDelete(inode, attr.Length)})
@@ -3219,8 +3226,10 @@ func (m *redisMeta) doWrite(ctx Context, inode Ino, indx uint32, off uint32, sli
 			return err
 		}
 		now := m.now()
-		attr.Mtime = mtime.Unix()
-		attr.Mtimensec = uint32(mtime.Nanosecond())
+		if !mtime.IsZero() {
+			attr.Mtime = mtime.Unix()
+			attr.Mtimensec = uint32(mtime.Nanosecond())
+		}
 		attr.Ctime = now.Unix()
 		attr.Ctimensec = uint32(now.Nanosecond())
 

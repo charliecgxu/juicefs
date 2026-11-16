@@ -2706,6 +2706,10 @@ func (m *kvMeta) doDeleteSustainedInode(ctx Context, sid uint64, inode Ino) erro
 			return nil
 		}
 		m.parseAttr(a, &attr)
+		if attr.Nlink > 0 {
+			tx.delete(m.sustainedKey(sid, inode))
+			return nil
+		}
 		newSpace = -align4K(attr.Length)
 		tx.set(m.delfileKey(inode, attr.Length), m.packInt64(m.now().Unix()))
 		tx.delete(m.inodeKey(inode))
@@ -2773,8 +2777,10 @@ func (m *kvMeta) doWrite(ctx Context, inode Ino, indx uint32, off uint32, slice 
 			return err
 		}
 		now := m.now()
-		attr.Mtime = mtime.Unix()
-		attr.Mtimensec = uint32(mtime.Nanosecond())
+		if !mtime.IsZero() {
+			attr.Mtime = mtime.Unix()
+			attr.Mtimensec = uint32(mtime.Nanosecond())
+		}
 		attr.Ctime = now.Unix()
 		attr.Ctimensec = uint32(now.Nanosecond())
 		val := marshalSlice(off, slice.Id, slice.Size, slice.Off, slice.Len)

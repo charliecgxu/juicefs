@@ -204,8 +204,16 @@ func (v *VFS) SetAttr(ctx Context, ino Ino, set int, fh uint64, mode, uid, gid u
 		}
 	}
 
+	var metadataEpoch uint64
+	var clearFastWriteMetadata bool
+	if v.fastWrite != nil && set&(meta.SetAttrMtime|meta.SetAttrMtimeNow) != 0 {
+		metadataEpoch, _, clearFastWriteMetadata = v.fastWrite.metadataState(ino)
+	}
 	err = v.Meta.SetAttr(ctx, ino, uint16(set), 0, attr)
 	if err == 0 {
+		if clearFastWriteMetadata {
+			v.fastWrite.metadataFlushed(ino, metadataEpoch)
+		}
 		v.UpdateLength(ino, attr)
 		entry = &meta.Entry{Inode: ino, Attr: attr}
 	}

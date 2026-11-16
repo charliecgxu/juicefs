@@ -3507,6 +3507,10 @@ func (m *dbMeta) doDeleteSustainedInode(ctx Context, sid uint64, inode Ino) erro
 		if !ok {
 			return nil
 		}
+		if n.Nlink > 0 {
+			_, err = s.Delete(&sustained{Sid: sid, Inode: inode})
+			return err
+		}
 		newSpace = -align4K(n.Length)
 		if err = mustInsert(s, &delfile{inode, n.Length, m.now().Unix()}); err != nil {
 			return err
@@ -3582,7 +3586,9 @@ func (m *dbMeta) doWrite(ctx Context, inode Ino, indx uint32, off uint32, slice 
 			return err
 		}
 		now := m.now().UnixNano()
-		nodeAttr.setMtime(mtime.UnixNano())
+		if !mtime.IsZero() {
+			nodeAttr.setMtime(mtime.UnixNano())
+		}
 		nodeAttr.setCtime(now)
 		m.parseAttr(&nodeAttr, attr)
 

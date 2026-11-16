@@ -183,6 +183,8 @@ func testMeta(t *testing.T, m Meta) {
 	testStickyBit(t, m)
 	testLocks(t, m)
 	testListLocks(t, m)
+	testWritePreservesMtime(t, m)
+	testRelinkOpenUnlinkedFile(t, m)
 	testConcurrentWrite(t, m)
 	testRace(t, m)
 	testXattr(t, m)
@@ -217,6 +219,67 @@ func testMeta(t *testing.T, m Meta) {
 	testKerberosToken(t, m)
 	base.conf.ReadOnly = true
 	testReadOnly(t, m)
+}
+
+func testWritePreservesMtime(t *testing.T, m Meta) {
+	ctx := Background()
+	const name = "write-preserve-mtime"
+	_ = m.Unlink(ctx, RootInode, name)
+	var inode Ino
+	var attr Attr
+	if errno := m.Create(ctx, RootInode, name, 0644, 0, 0, &inode, &attr); errno != 0 {
+		t.Fatalf("create preserve-mtime file: %s", errno)
+	}
+	defer m.Unlink(ctx, RootInode, name)
+
+	expected := Attr{Mtime: 1700000000, Mtimensec: 123456789}
+	if errno := m.SetAttr(ctx, inode, SetAttrMtime, 0, &expected); errno != 0 {
+		t.Fatalf("set preserve-mtime value: %s", errno)
+	}
+	var sliceID uint64
+	if errno := m.NewSlice(ctx, &sliceID); errno != 0 {
+		t.Fatalf("allocate preserve-mtime slice: %s", errno)
+	}
+	if errno := m.Write(ctx, inode, 0, 0, Slice{Id: sliceID, Size: 4096, Len: 4096}, time.Time{}); errno != 0 {
+		t.Fatalf("write while preserving mtime: %s", errno)
+	}
+	if errno := m.GetAttr(ctx, inode, &attr); errno != 0 {
+		t.Fatalf("get preserve-mtime attr: %s", errno)
+	}
+	if attr.Mtime != expected.Mtime || attr.Mtimensec != expected.Mtimensec {
+		t.Fatalf("mtime changed to %d.%09d, want %d.%09d",
+			attr.Mtime, attr.Mtimensec, expected.Mtime, expected.Mtimensec)
+	}
+}
+
+func testRelinkOpenUnlinkedFile(t *testing.T, m Meta) {
+	ctx := Background()
+	const name = "relink-open-unlinked"
+	_ = m.Unlink(ctx, RootInode, name)
+	var inode Ino
+	var attr Attr
+	if errno := m.Create(ctx, RootInode, name, 0644, 0, 0, &inode, &attr); errno != 0 {
+		t.Fatalf("create unlinked file: %s", errno)
+	}
+	if errno := m.Unlink(ctx, RootInode, name); errno != 0 {
+		t.Fatalf("unlink open file: %s", errno)
+	}
+	if errno := m.Truncate(ctx, inode, 1, 4096, &attr, true); errno != 0 {
+		t.Fatalf("truncate open unlinked file: %s", errno)
+	}
+	if errno := m.Link(ctx, inode, RootInode, name, &attr); errno != 0 {
+		t.Fatalf("link open unlinked file: %s", errno)
+	}
+	if errno := m.Close(ctx, inode); errno != 0 {
+		t.Fatalf("close relinked file: %s", errno)
+	}
+	if errno := m.Lookup(ctx, RootInode, name, &inode, &attr, false); errno != 0 {
+		t.Fatalf("lookup relinked file: %s", errno)
+	}
+	if attr.Nlink == 0 || attr.Length != 4096 {
+		t.Fatalf("relinked file attr nlink=%d length=%d", attr.Nlink, attr.Length)
+	}
+	_ = m.Unlink(ctx, RootInode, name)
 }
 
 func testXattr(t *testing.T, m Meta) {

@@ -405,7 +405,7 @@ func getDaemonStage() int {
 }
 
 func fuseFlags() []cli.Flag {
-	return addCategories("FUSE", []cli.Flag{
+	flags := []cli.Flag{
 		&cli.BoolFlag{
 			Name:  "enable-xattr",
 			Usage: "enable extended attributes (xattr)",
@@ -452,7 +452,26 @@ func fuseFlags() []cli.Flag {
 			Name:  "o",
 			Usage: "other FUSE options",
 		},
-	})
+	}
+	if runtime.GOOS == "linux" {
+		flags = append(flags,
+			&cli.StringFlag{
+				Name:  "fast-write-dir",
+				Usage: "directory for experimental unpublished Fast Write data (enables writeback_cache and noatime)",
+			},
+			&cli.IntFlag{
+				Name:  "fast-write-sync-concurrency",
+				Value: vfs.DefaultFastWriteSyncConcurrency,
+				Usage: "maximum concurrent Fast Write chunk fdatasync calls",
+			},
+			&cli.IntFlag{
+				Name:  "fuse-max-dirty-ratio",
+				Value: 50,
+				Usage: "maximum percentage of the global dirty-page budget available to this FUSE mount (0 keeps the kernel default)",
+			},
+		)
+	}
+	return addCategories("FUSE", flags)
 }
 
 func mountFlags() []cli.Flag {

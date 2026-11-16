@@ -280,7 +280,138 @@ func expandPathForEmbedded(addr string) string {
 	return addr
 }
 
+func canonicalPath(path string) (string, error) {
+	abs, err := filepath.Abs(path)
+	if err != nil {
+		return "", err
+	}
+	abs = filepath.Clean(abs)
+	var suffix []string
+	current := abs
+	for {
+		resolved, resolveErr := filepath.EvalSymlinks(current)
+		if resolveErr == nil {
+			for i := len(suffix) - 1; i >= 0; i-- {
+				resolved = filepath.Join(resolved, suffix[i])
+			}
+			return filepath.Clean(resolved), nil
+		}
+		if !os.IsNotExist(resolveErr) {
+			return "", resolveErr
+		}
+		parent := filepath.Dir(current)
+		if parent == current {
+			return "", resolveErr
+		}
+		suffix = append(suffix, filepath.Base(current))
+		current = parent
+	}
+}
+
+func pathWithin(parent, child string) (bool, error) {
+	relative, err := filepath.Rel(parent, child)
+	if err != nil {
+		return false, err
+	}
+	return relative == "." || relative != ".." && !strings.HasPrefix(relative, ".."+string(os.PathSeparator)), nil
+}
+
+func pathsOverlap(first, second string) (bool, error) {
+	firstContainsSecond, err := pathWithin(first, second)
+	if err != nil {
+		return false, err
+	}
+	secondContainsFirst, err := pathWithin(second, first)
+	return firstContainsSecond || secondContainsFirst, err
+}
+
+func validateFastWriteMountPath(fastWriteDir, mountpoint string) error {
+	fastWriteAbs, err := filepath.Abs(fastWriteDir)
+	if err != nil {
+		return fmt.Errorf("resolve Fast Write directory: %w", err)
+	}
+	mountAbs, err := filepath.Abs(mountpoint)
+	if err != nil {
+		return fmt.Errorf("resolve mountpoint: %w", err)
+	}
+	if overlap, relErr := pathsOverlap(filepath.Clean(mountAbs), filepath.Clean(fastWriteAbs)); relErr != nil {
+		return relErr
+	} else if overlap {
+		return fmt.Errorf("Fast Write directory %q must not overlap mountpoint %q", fastWriteDir, mountpoint)
+	}
+	fastWritePath, err := canonicalPath(fastWriteDir)
+	if err != nil {
+		return fmt.Errorf("resolve Fast Write directory: %w", err)
+	}
+	mountPath, err := canonicalPath(mountpoint)
+	if err != nil {
+		return fmt.Errorf("resolve mountpoint: %w", err)
+	}
+	overlap, err := pathsOverlap(mountPath, fastWritePath)
+	if err != nil {
+		return err
+	}
+	if overlap {
+		return fmt.Errorf("Fast Write directory %q must not overlap mountpoint %q", fastWriteDir, mountpoint)
+	}
+	return nil
+}
+
+func validateFastWriteMountConfig(conf *vfs.Config, format *meta.Format, mountpoint string) error {
+	if conf.FastWriteDir == "" {
+		return nil
+	}
+	if runtime.GOOS != "linux" {
+		return fmt.Errorf("--fast-write-dir is only supported on Linux")
+	}
+	if conf.FuseOpts == nil || !conf.FuseOpts.EnableWriteback {
+		return fmt.Errorf("--fast-write-dir requires -o writeback_cache")
+	}
+	if conf.Meta == nil || conf.Meta.AtimeMode != meta.NoAtime {
+		return fmt.Errorf("--fast-write-dir requires --atime-mode=noatime")
+	}
+	if conf.FastWriteSyncConcurrency <= 0 {
+		return fmt.Errorf("--fast-write-sync-concurrency must be greater than 0")
+	}
+	if err := validateFastWriteMountPath(conf.FastWriteDir, mountpoint); err != nil {
+		return err
+	}
+	if format != nil && format.TrashDays > 0 {
+		return fmt.Errorf("--fast-write-dir requires trash-days=0")
+	}
+	return nil
+}
+
+func applyFastWriteMountDependencies(conf *vfs.Config) {
+	if conf == nil || conf.FastWriteDir == "" {
+		return
+	}
+	if conf.FuseOpts == nil {
+		conf.FuseOpts = &vfs.FuseOptions{}
+	}
+	if !conf.FuseOpts.EnableWriteback {
+		logger.Infof("Fast Write enables FUSE writeback_cache")
+		conf.FuseOpts.EnableWriteback = true
+	}
+	if conf.Meta != nil && conf.Meta.AtimeMode != meta.NoAtime {
+		logger.Infof("Fast Write changes atime mode from %q to %q", conf.Meta.AtimeMode, meta.NoAtime)
+		conf.Meta.AtimeMode = meta.NoAtime
+	}
+	if conf.FastWriteSyncConcurrency <= 0 {
+		logger.Infof("Fast Write uses default sync concurrency %d", vfs.DefaultFastWriteSyncConcurrency)
+		conf.FastWriteSyncConcurrency = vfs.DefaultFastWriteSyncConcurrency
+	}
+}
+
 func getVfsConf(c *cli.Context, metaConf *meta.Config, format *meta.Format, chunkConf *chunk.Config) *vfs.Config {
+	fastWriteDir := c.String("fast-write-dir")
+	if fastWriteDir != "" {
+		var err error
+		fastWriteDir, err = filepath.Abs(fastWriteDir)
+		if err != nil {
+			logger.Fatalf("invalid Fast Write directory %q: %s", c.String("fast-write-dir"), err)
+		}
+	}
 	cfg := &vfs.Config{
 		Meta:   metaConf,
 		Format: *format,
@@ -298,6 +429,11 @@ func getVfsConf(c *cli.Context, metaConf *meta.Config, format *meta.Format, chun
 		PPid:            os.Getppid(),
 		UMask:           0xFFFF,
 		HideInternal:    c.Bool("hide-internal"),
+		FastWriteDir:    fastWriteDir,
+	}
+	if runtime.GOOS == "linux" {
+		cfg.FuseMaxDirtyRatio = c.Int("fuse-max-dirty-ratio")
+		cfg.FastWriteSyncConcurrency = c.Int("fast-write-sync-concurrency")
 	}
 
 	if c.IsSet("umask") {
@@ -613,6 +749,13 @@ func mount(c *cli.Context) error {
 	chunkConf := getChunkConf(c, format)
 	vfsConf := getVfsConf(c, metaConf, format, chunkConf)
 	setFuseOption(c, format, vfsConf)
+	applyFastWriteMountDependencies(vfsConf)
+	if vfsConf.FuseMaxDirtyRatio < 0 || vfsConf.FuseMaxDirtyRatio > 100 {
+		return fmt.Errorf("--fuse-max-dirty-ratio must be between 0 and 100")
+	}
+	if err = validateFastWriteMountConfig(vfsConf, format, mp); err != nil {
+		return err
+	}
 	if stage == 0 || stage == 3 {
 		blob, err = NewReloadableStorage(format, metaCli, updateFormat(c))
 		if err != nil {
@@ -682,12 +825,26 @@ func mount(c *cli.Context) error {
 		logger.Fatalf("new session: %s", err)
 	}
 
-	metaCli.OnReload(func(fmt *meta.Format) error {
-		updateFormat(c)(fmt)
-		store.UpdateLimit(fmt.UploadLimit, fmt.DownloadLimit)
+	v := vfs.NewVFS(vfsConf, metaCli, store, registerer, registry)
+	if err = v.FastWriteInitError(); err != nil {
+		_ = metaCli.CloseSession()
+		object.Shutdown(blob)
+		return fmt.Errorf("Fast Write: %s", err)
+	}
+	metaCli.OnReload(func(newFormat *meta.Format) error {
+		if vfsConf.FastWriteDir != "" && newFormat.TrashDays > 0 {
+			v.BlockFastWriteForTrash()
+			return fmt.Errorf("Fast Write requires trash-days=0")
+		}
+		updateFormat(c)(newFormat)
+		store.UpdateLimit(newFormat.UploadLimit, newFormat.DownloadLimit)
 		return nil
 	})
-	v := vfs.NewVFS(vfsConf, metaCli, store, registerer, registry)
+	if vfsConf.FastWriteDir != "" && metaCli.GetFormat().TrashDays > 0 {
+		_ = metaCli.CloseSession()
+		object.Shutdown(blob)
+		return fmt.Errorf("Fast Write requires trash-days=0")
+	}
 	installHandler(metaCli, mp, v, blob)
 	v.UpdateFormat = updateFormat(c)
 	initBackgroundTasks(c, vfsConf, metaConf, metaCli, blob, registerer, registry)
