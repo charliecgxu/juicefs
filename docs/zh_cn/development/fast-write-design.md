@@ -102,8 +102,8 @@ upload 按 generation 顺序扫描 bitmap，将连续置位页面转换为现有
 
 - 两种命令都会在返回前同步 checkpoint + seal 全部目标 inode，固定本次 generation 边界；默认命令只把后续 materialize/upload 放到后台。
 - 未启用 JuiceFS `--writeback`：先完成该 generation 的全部对象 Put，再执行 `meta.Write`。
-- 启用 JuiceFS `--writeback`：先把该 generation 的全部 dense slice 持久化到 staging 并强制上传，再执行 `meta.Write`。
-- `--wait` 会强制上传并等待本次 staging 对象完成，应用只能在该命令成功后 publish。
+- 启用 JuiceFS `--writeback`：`writer.Finish` 把 dense slice 写入 staging，然后按社区写路径提交 `meta.Write`。对象由后台按 `--upload-delay` 和上传窗口上传。
+- `--wait` 等待本次 `meta.Write` 完成。其他客户端要等到 staging 对象上传完成后才能读到，这与社区 `--writeback` 相同，由应用自行处理。
 
 upload 不维护额外 journal。失败时保留 sealed generation；重试重新扫描 bitmap、分配 SliceID 并从头上传。对象阶段失败只会留下可由 GC 清理的孤儿对象；metadata 阶段失败后重试可能留下被新记录覆盖的重复 slice，由社区 compact/GC 处理。只有 `--wait` 成功才允许 publish。materialize 使用零 mtime 写入语义，不会覆盖并发新 generation 或显式设置的 inode mtime。
 

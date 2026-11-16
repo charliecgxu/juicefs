@@ -82,7 +82,7 @@ sudo -E FAST_WRITE_BIN="$FAST_WRITE_BIN" COMMUNITY_BIN="$COMMUNITY_BIN" \
 - rename、hardlink 和最后链接删除；
 - 默认异步 upload 的 seal 边界，以及后续 `--wait`；
 - Fast Write 挂载自动补齐 `writeback_cache` 和 `noatime`，测试命令不再显式传入；
-- 开关 JuiceFS `--writeback` 时 staging 对象可见后再提交 metadata；
+- 开启 JuiceFS `--writeback` 时沿用社区 staging 和 `--upload-delay`；
 - 社区基线客户端无需理解 Fast Write 本地格式即可读取发布结果；
 - FUSE BDI `max_ratio` 与挂载参数一致。
 

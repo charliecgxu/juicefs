@@ -51,7 +51,7 @@ FUSE 支持[「writeback-cache 模式」](https://www.kernel.org/doc/Documentati
 
 `--fast-write-dir` 将尚未 publish 的文件页保存在持久化本地稀疏文件中。启用后会自动开启必需的 FUSE `writeback_cache` 并把 atime 模式调整为 `noatime`。该功能仅适用于单写客户端且 publish 前其他客户端不会访问相同 inode 的工作流。
 
-upload 前必须停止写入，并逐文件 `fsync` 或关闭全部 writable FD；控制命令不能替目标文件排空 FUSE 脏页。默认命令和 `--wait` 都会在返回前 checkpoint 并 seal 全部目标 inode：默认命令随后在后台 materialize 固定 generation，publish 前则必须使用 `juicefs upload-fast-write --wait PATH` 等待对象真正可读。一个 generation 的全部对象（包括 JuiceFS writeback staging block）持久化后才提交 slice metadata；失败时保留 sealed generation，下次不依赖额外 journal，直接从头重试。
+upload 前必须停止写入，并逐文件 `fsync` 或关闭全部 writable FD；控制命令不能替目标文件排空 FUSE 脏页。默认命令和 `--wait` 都会在返回前 checkpoint 并 seal 全部目标 inode：默认命令随后在后台 materialize 固定 generation，`--wait` 等待 slice metadata 提交完成。开启 JuiceFS `--writeback` 时，对象仍按社区的 `--upload-delay` 和上传窗口后台上传，其他客户端的可见时间由应用自行处理。失败时保留 sealed generation，下次不依赖额外 journal，直接从头重试。
 
 seal 会先把 active generation reflink 到临时目录；不支持 reflink 时按 bitmap 只复制有效 4 KiB 页，再经过文件和目录同步原子发布 sealed generation。原 active 只在 sealed 已持久化后进入 retired 清理阶段，因此 seal 不会通过直接移动唯一数据副本来固定边界；崩溃恢复会处理 sealing/retired 中间状态。
 

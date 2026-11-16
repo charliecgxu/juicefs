@@ -34,10 +34,6 @@ type UploadFastWriteResponse struct {
 	State           string `json:"state"`
 }
 
-type fastWriteStagingFlusher interface {
-	FlushStagingSlice(id uint64, size int) error
-}
-
 type fastWriteUploadTarget struct {
 	inode         Ino
 	maxGeneration uint64
@@ -142,18 +138,6 @@ func (v *VFS) uploadFastWriteTarget(ctx meta.Context, target *fastWriteUploadTar
 				return syscall.EIO
 			}
 			slices = append(slices, fastWriteSlice{run: run, sliceID: sliceID, size: uint32(len(data))})
-		}
-		if v.Conf.Chunk.Writeback && len(slices) > 0 {
-			flusher, ok := v.Store.(fastWriteStagingFlusher)
-			if !ok {
-				return syscall.ENOTSUP
-			}
-			for _, object := range slices {
-				if err := flusher.FlushStagingSlice(object.sliceID, int(object.size)); err != nil {
-					logger.Errorf("flush Fast Write staging slice %d: %s", object.sliceID, err)
-					return syscall.EIO
-				}
-			}
 		}
 		for _, object := range slices {
 			chunkOffset := object.run.StartPage * uint32(fastWritePageSize)

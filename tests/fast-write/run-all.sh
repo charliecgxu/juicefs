@@ -22,7 +22,6 @@ export MOCKEY_CHECK_GCFLAGS=false
 "$go_bin" test ./pkg/vfs \
 	-skip '^(TestReaddirCache|TestVFSReadDirSort|TestReadDirBatch|TestReaddir)$' \
 	-count=1 -timeout=15m
-"$go_bin" test ./pkg/chunk -run '^TestFlushStagingSlice' -count=1
 "$go_bin" test ./pkg/fuse -run '^TestSetMaxDirtyRatioAt' -count=1
 "$go_bin" test ./cmd \
 	-run '^(TestFuseMaxDirtyRatioFlag|TestFastWriteMountFlags|TestValidateFastWriteMountPath|TestValidateFastWriteMountConfig|TestApplyFastWriteMountDependencies|TestUploadFastWriteCommand|TestEncodeUploadFastWriteRequest)$' \

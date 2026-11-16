@@ -106,37 +106,6 @@ func TestVFSFastWriteRejectsInternalNamespaceMutations(t *testing.T) {
 	}
 }
 
-type recordingFastWriteStagingStore struct {
-	chunk.ChunkStore
-	calls  atomic.Int32
-	start  chan struct{}
-	block  chan struct{}
-	failAt int32
-}
-
-func (s *recordingFastWriteStagingStore) FlushStagingSlice(id uint64, size int) error {
-	call := s.calls.Add(1)
-	if s.start != nil {
-		select {
-		case s.start <- struct{}{}:
-		default:
-		}
-	}
-	if s.block != nil {
-		<-s.block
-	}
-	if call == s.failAt {
-		return errors.New("injected Fast Write staging flush failure")
-	}
-	flusher, ok := s.ChunkStore.(interface {
-		FlushStagingSlice(uint64, int) error
-	})
-	if !ok {
-		return errors.New("wrapped store cannot flush staging")
-	}
-	return flusher.FlushStagingSlice(id, size)
-}
-
 type failingFastWriteStore struct {
 	chunk.ChunkStore
 	failAt   int32
@@ -776,13 +745,6 @@ func TestVFSFastWriteAsyncUploadSealsBeforeReturn(t *testing.T) {
 	v.Conf.FastWriteDir = fastWrite.root
 	v.Conf.FuseOpts.EnableWriteback = true
 	v.Conf.Chunk.Writeback = true
-	started := make(chan struct{}, 1)
-	block := make(chan struct{})
-	var releaseOnce sync.Once
-	release := func() { releaseOnce.Do(func() { close(block) }) }
-	defer release()
-	store := &recordingFastWriteStagingStore{ChunkStore: v.Store, start: started, block: block}
-	v.Store = store
 	ctx := NewLogContext(meta.NewContext(104, 0, []uint32{0}))
 
 	entry, fh, errno := v.Create(ctx, meta.RootInode, "fast-write-async-seal", 0644, 0, syscall.O_RDWR)
@@ -792,30 +754,6 @@ func TestVFSFastWriteAsyncUploadSealsBeforeReturn(t *testing.T) {
 	require.Zero(t, errno)
 	require.Zero(t, v.Write(ctx, second.Inode, bytes.Repeat([]byte{'b'}, int(fastWritePageSize)), 0, secondFH))
 
-	stat, errno := v.uploadFastWritePaths(ctx, nil, true)
-	require.Zero(t, errno)
-	require.Equal(t, "scheduled", stat.State)
-	require.Equal(t, uint64(2), stat.FileCount)
-
-	for _, inode := range []Ino{entry.Inode, second.Inode} {
-		file := fastWrite.get(inode)
-		require.NotNil(t, file)
-		file.RLock()
-		require.Len(t, file.generations, 2)
-		require.Equal(t, fastWriteSealed, file.generations[0].State)
-		require.Equal(t, fastWriteActive, file.generations[1].State)
-		file.RUnlock()
-	}
-	select {
-	case <-started:
-	case <-time.After(5 * time.Second):
-		t.Fatal("background upload did not reach staging")
-	}
-	var pending []meta.Slice
-	require.Zero(t, v.Meta.Read(ctx, entry.Inode, 0, &pending))
-	for _, slice := range pending {
-		require.Zero(t, slice.Id, "metadata was published before staging became durable")
-	}
 	const (
 		newMtime     = int64(1800000000)
 		newMtimensec = uint32(987654321)
@@ -823,7 +761,10 @@ func TestVFSFastWriteAsyncUploadSealsBeforeReturn(t *testing.T) {
 	_, errno = v.SetAttr(ctx, entry.Inode, int(meta.SetAttrMtime), fh, 0, 0, 0, 0,
 		newMtime, 0, newMtimensec, 0)
 	require.Zero(t, errno)
-	release()
+	stat, errno := v.uploadFastWritePaths(ctx, nil, true)
+	require.Zero(t, errno)
+	require.Equal(t, "scheduled", stat.State)
+	require.Equal(t, uint64(2), stat.FileCount)
 	require.Eventually(t, func() bool {
 		return len(fastWrite.listInodes()) == 0
 	}, 5*time.Second, 10*time.Millisecond)
@@ -928,8 +869,6 @@ func TestVFSFastWriteWritebackFlushesBeforeRelease(t *testing.T) {
 	v.Conf.FastWriteDir = fastWrite.root
 	v.Conf.FuseOpts.EnableWriteback = true
 	v.Conf.Chunk.Writeback = true
-	store := &recordingFastWriteStagingStore{ChunkStore: v.Store}
-	v.Store = store
 	ctx := NewLogContext(meta.NewContext(103, 0, []uint32{0}))
 
 	entry, fh, errno := v.Create(ctx, meta.RootInode, "fast-write-writeback", 0644, 0, syscall.O_RDWR)
@@ -938,7 +877,7 @@ func TestVFSFastWriteWritebackFlushesBeforeRelease(t *testing.T) {
 
 	stat := &UploadFastWriteResponse{}
 	require.Zero(t, v.uploadFastWriteInode(ctx, entry.Inode, stat))
-	require.Positive(t, store.calls.Load())
+	require.Positive(t, stat.SliceCount)
 	require.Empty(t, fastWrite.listInodes())
 }
 
@@ -2382,47 +2321,6 @@ func TestVFSFastWriteFlushAllCheckpointsRecoverableState(t *testing.T) {
 	require.Zero(t, errno)
 	require.Equal(t, len(got), n)
 	require.Equal(t, content, got)
-}
-
-func TestVFSFastWriteWritebackStagingFailureIsRetryable(t *testing.T) {
-	v, _ := createTestVFS(nil, "")
-	fastWrite, err := openFastWrite(t.TempDir())
-	require.NoError(t, err)
-	defer fastWrite.close()
-	v.fastWrite = fastWrite
-	v.Conf.FastWriteDir = fastWrite.root
-	v.Conf.FuseOpts.EnableWriteback = true
-	v.Conf.Chunk.Writeback = true
-	store := &recordingFastWriteStagingStore{ChunkStore: v.Store, failAt: 2}
-	v.Store = store
-	ctx := NewLogContext(meta.NewContext(122, 0, []uint32{0}))
-
-	entry, fh, errno := v.Create(ctx, meta.RootInode, "fast-write-staging-retry", 0644, 0, syscall.O_RDWR)
-	require.Zero(t, errno)
-	first := bytes.Repeat([]byte{'a'}, int(fastWritePageSize))
-	third := bytes.Repeat([]byte{'c'}, int(fastWritePageSize))
-	require.Zero(t, v.Write(ctx, entry.Inode, first, 0, fh))
-	require.Zero(t, v.Write(ctx, entry.Inode, third, fastWritePageSize*2, fh))
-
-	require.Equal(t, syscall.EIO, v.uploadFastWriteInode(ctx, entry.Inode, &UploadFastWriteResponse{}))
-	var slices []meta.Slice
-	require.Zero(t, v.Meta.Read(ctx, entry.Inode, 0, &slices))
-	for _, slice := range slices {
-		require.Zero(t, slice.Id, "metadata became visible after a partial staging flush")
-	}
-	require.NotEmpty(t, fastWrite.listInodes())
-
-	store.failAt = 0
-	require.Zero(t, v.uploadFastWriteInode(ctx, entry.Inode, &UploadFastWriteResponse{}))
-	require.GreaterOrEqual(t, store.calls.Load(), int32(4))
-	require.Empty(t, fastWrite.listInodes())
-	got := make([]byte, fastWritePageSize*3)
-	n, errno := v.Read(ctx, entry.Inode, got, 0, fh)
-	require.Zero(t, errno)
-	require.Equal(t, len(got), n)
-	require.Equal(t, first, got[:fastWritePageSize])
-	require.True(t, allZero(got[fastWritePageSize:fastWritePageSize*2]))
-	require.Equal(t, third, got[fastWritePageSize*2:])
 }
 
 func TestVFSFastWriteRenameHardlinkAndLastCloseLifecycle(t *testing.T) {
